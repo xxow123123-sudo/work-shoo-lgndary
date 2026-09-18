@@ -1,0 +1,16 @@
+{
+  "name":"legendary-workshop",
+  "private":true,
+  "workspaces":["apps/*"],
+  "scripts":{
+    "dev:web":"npm --workspace apps/web run dev",
+    "dev:bot":"npm --workspace apps/bot run dev",
+    "build:web":"npm --workspace apps/web run build",
+    "start:web":"npm --workspace apps/web run start",
+    "start:bot":"npm --workspace apps/bot run start",
+    "db:setup":"node database/setup.mjs"
+  },
+  "dependencies":{"pg":"latest"},
+  "devDependencies":{"@types/pg":"latest"},
+  "engines":{"node":">=20"}
+}
