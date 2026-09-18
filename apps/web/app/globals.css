@@ -58,8 +58,8 @@ footer{text-align:center;color:#555b61;font-size:12px;padding:24px 0 38px}
 .legendary-form.one-column{grid-template-columns:1fr}.legendary-form.one-column .submit-btn{grid-column:1}.form-message.outside{margin:18px 0 0}.status-result{margin-top:22px}.status-result b{color:#eceef0}
 
 /* Legendary visual system v2 */
-html,body,a,button,input,textarea,select,label{cursor:url('/screwdriver-cursor.svg') 5 4,auto}
-button,a,[role="button"],input[type="checkbox"]{cursor:url('/screwdriver-cursor.svg') 5 4,pointer}
+html,body,a,button,input,textarea,select,label{cursor:url('/wheel-wrench-cursor.svg') 5 4,auto}
+button,a,[role="button"],input[type="checkbox"]{cursor:url('/wheel-wrench-cursor.svg') 5 4,pointer}
 body{position:relative;overflow-x:hidden;background:
   radial-gradient(circle at 12% 12%,rgba(210,214,220,.07),transparent 23%),
   radial-gradient(circle at 88% 8%,rgba(153,159,167,.045),transparent 25%),
@@ -306,3 +306,25 @@ body:before{
 @media(max-width:1000px){.metric-grid-5{grid-template-columns:repeat(3,1fr)}.staff-nav{grid-template-columns:auto 1fr}.staff-user{display:none}.cycle-strip{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:760px){.staff-shell{width:min(100% - 20px,1320px);padding-top:10px}.staff-nav{height:auto;min-height:64px;grid-template-columns:1fr auto;gap:10px;padding:10px 12px;top:8px}.staff-brand img{width:36px;height:36px}.staff-brand div span{display:none}.staff-nav-links{justify-content:flex-end;overflow:auto}.staff-nav-links a{white-space:nowrap;padding:8px;font-size:10px}.staff-content{padding-top:18px}.staff-hero{padding:24px;display:grid}.staff-hero:after{font-size:38px}.profile-chip{width:100%;min-height:100px}.metric-grid-4,.metric-grid-5{grid-template-columns:repeat(2,minmax(0,1fr))}.metric-card{min-height:110px}.metric-card strong{font-size:24px}.dashboard-grid.two-one,.dashboard-grid.equal,.action-accordion-grid,.admin-control-grid{grid-template-columns:1fr}.application-row{grid-template-columns:1fr 1fr}.application-row.header{display:none}.cycle-strip{grid-template-columns:1fr 1fr}.recruitment-control{align-items:flex-start;display:grid}.leave-fields{grid-template-columns:1fr}.staff-section-kicker{margin-right:4px}}
 @media(max-width:460px){.metric-grid-4,.metric-grid-5{grid-template-columns:1fr 1fr}.panel-card{padding:16px}.staff-hero h1{font-size:29px}.staff-nav-links a:nth-child(1){display:none}.cycle-strip{grid-template-columns:1fr}.application-row{grid-template-columns:1fr}.activity-row{grid-template-columns:36px 1fr}.activity-amount{grid-column:2;text-align:right}.metric-card strong{font-size:21px}}
+
+
+/* Global Legendary credit / support */
+.site-credit-global{
+  width:min(1180px,calc(100% - 36px));
+  margin:18px auto 24px;
+  padding:13px 16px;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+  color:#737a82;
+  font-size:11px;
+  letter-spacing:.15px;
+  text-align:center;
+  border-top:1px solid rgba(177,184,191,.13);
+}
+.site-credit-global strong{color:#d6dade;letter-spacing:1.4px}
+.site-credit-global a{color:#aeb4bb;text-decoration:none;border-bottom:1px solid rgba(174,180,187,.28);padding-bottom:1px}
+.site-credit-global a:hover{color:#fff;border-color:#fff}
+.site-credit-global .credit-sep{color:#42484f}

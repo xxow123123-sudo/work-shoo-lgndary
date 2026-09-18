@@ -1,6 +1,22 @@
 {
-  "name":"bot","private":true,"type":"module",
-  "scripts":{"dev":"tsx watch src/index.ts","start":"tsx src/index.ts"},
-  "dependencies":{"discord.js":"latest","dotenv":"latest","pg":"latest","tesseract.js":"latest"},
-  "devDependencies":{"tsx":"latest","typescript":"latest","@types/node":"latest","@types/pg":"latest"}
+  "name": "bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "discord.js": "latest",
+    "dotenv": "latest",
+    "pg": "latest",
+    "tesseract.js": "latest",
+    "sharp": "latest"
+  },
+  "devDependencies": {
+    "tsx": "latest",
+    "typescript": "latest",
+    "@types/node": "latest",
+    "@types/pg": "latest"
+  }
 }

@@ -24,9 +24,6 @@ export default async function Home(){
     const {data:application}=await db.from('applications').select('id').eq('id',applicationId).maybeSingle();
     if(application) redirect('/apply/status');
   }
-  const {data:rows}=await db.from('current_week_stats').select('*');
-  const stats=(rows??[]).reduce((a:any,r:any)=>({tool:a.tool+(r.tool_sales||0),mods:a.mods+(r.vehicle_mods||0),money:a.money+Number(r.invoice_total||0)}),{tool:0,mods:0,money:0});
-  const {count:online}=await db.from('attendance').select('*',{count:'exact',head:true}).is('clock_out',null);
   const {data:setting}=await db.from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key','recruitment_open').maybeSingle();
   const recruitmentOpen=setting?.value===undefined?true:setting.value==='true';
 
@@ -75,20 +72,7 @@ export default async function Home(){
       </>}
     </section>
 
-    <section className="weekly-block">
-      <div className="section-heading compact">
-        <p>THIS WEEK</p>
-        <h2>إنجازنا هذا الأسبوع</h2>
-      </div>
-      <div className="stats-row">
-        <div><strong>{stats.tool}</strong><span>بيع عِدّة</span></div>
-        <div><strong>{stats.mods}</strong><span>تعديل مركبات</span></div>
-        <div><strong>{stats.tool+stats.mods}</strong><span>إجمالي الخدمات</span></div>
-        <div><strong>${stats.money.toLocaleString()}</strong><span>قيمة الفواتير</span></div>
-        <div><strong>{online??0}</strong><span>داخل الدوام الآن</span></div>
-      </div>
-    </section>
 
-    <footer>Legendary Workshop</footer>
+
   </main>;
 }

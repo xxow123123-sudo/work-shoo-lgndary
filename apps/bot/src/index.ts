@@ -20,6 +20,7 @@ import {
   UserSelectMenuBuilder,
 } from 'discord.js';
 import { createWorker } from 'tesseract.js';
+import sharp from 'sharp';
 
 const required = ['DATABASE_URL','DISCORD_BOT_TOKEN','DISCORD_CLIENT_ID','DISCORD_GUILD_ID'];
 for (const key of required) if (!process.env[key]) throw new Error(`Missing environment variable: ${key}`);
@@ -105,34 +106,94 @@ async function activeLeaveForEmployee(employeeId:string){
   return data;
 }
 let ocrWorkerPromise:Promise<any>|null=null;
+let ocrQueue:Promise<void>=Promise.resolve();
 async function ocrWorker(){
   if(!ocrWorkerPromise) ocrWorkerPromise=createWorker('eng');
   return ocrWorkerPromise;
 }
-async function extractInvoiceAmount(imageUrl:string){
-  try{
-    const r=await fetch(imageUrl); if(!r.ok) return null;
-    const bytes=Buffer.from(await r.arrayBuffer());
-    const worker=await ocrWorker(); const out=await worker.recognize(bytes);
-    const text=String(out?.data?.text||'').replace(/\r/g,' ');
-    const patterns=[
-      /MONEY\s*AMOUNT[\s\S]{0,35}?([0-9][0-9, .]{2,})/i,
-      /AMOUNT[\s\S]{0,20}?([0-9][0-9, .]{2,})/i,
-    ];
-    for(const p of patterns){
-      const m=text.match(p); if(!m) continue;
-      const raw=m[1].replace(/[ ,]/g,'').replace(/\.(?=\d{3}(?:\D|$))/g,'');
-      const n=Number(raw); if(Number.isFinite(n)&&n>=0) return n;
-    }
-  }catch(e){ console.error('invoice OCR',e); }
+async function withOcrLock<T>(job:()=>Promise<T>):Promise<T>{
+  const previous=ocrQueue;
+  let release!:()=>void;
+  ocrQueue=new Promise<void>(resolve=>{ release=resolve; });
+  await previous;
+  try{return await job();}finally{release();}
+}
+function parseAmountNearLabel(text:string){
+  const cleaned=String(text||'').replace(/\r/g,' ').replace(/[Oo]/g,'0');
+  const patterns=[
+    /MONEY\s*AMOUNT[\s\S]{0,55}?\$?\s*([0-9][0-9, .]{2,})/i,
+    /AMOUNT[\s\S]{0,35}?\$?\s*([0-9][0-9, .]{2,})/i,
+  ];
+  for(const p of patterns){
+    const m=cleaned.match(p); if(!m) continue;
+    const raw=m[1].replace(/[ ,]/g,'').replace(/\.(?=\d{3}(?:\D|$))/g,'');
+    const n=Number(raw); if(Number.isFinite(n)&&n>=100&&n<=999999999) return Math.round(n);
+  }
   return null;
 }
+function parseDigitCandidates(text:string){
+  const candidates=(String(text||'').replace(/[Oo]/g,'0').match(/\d{3,9}/g)||[])
+    .map(x=>Number(x)).filter(n=>Number.isFinite(n)&&n>=100&&n<=999999999);
+  if(!candidates.length) return null;
+  return Math.max(...candidates);
+}
+async function invoiceVariants(bytes:Buffer){
+  const image=sharp(bytes,{failOn:'none'});
+  const meta=await image.metadata();
+  const width=Math.max(1,meta.width||736), height=Math.max(1,meta.height||503);
+  const full=await sharp(bytes,{failOn:'none'}).resize({width:1800,withoutEnlargement:false}).grayscale().normalize().sharpen().png().toBuffer();
+  const left=Math.max(0,Math.floor(width*0.16));
+  const top=Math.max(0,Math.floor(height*0.49));
+  const cropWidth=Math.max(1,Math.min(width-left,Math.floor(width*0.68)));
+  const cropHeight=Math.max(1,Math.min(height-top,Math.floor(height*0.24)));
+  const cropped=sharp(bytes,{failOn:'none'}).extract({left,top,width:cropWidth,height:cropHeight}).resize({width:1900,withoutEnlargement:false}).grayscale().normalize().sharpen();
+  const cropSoft=await cropped.clone().png().toBuffer();
+  const cropNormal=await cropped.clone().threshold(145).png().toBuffer();
+  const cropInverted=await cropped.clone().negate().threshold(145).png().toBuffer();
+  return {full,cropSoft,cropNormal,cropInverted};
+}
+async function extractInvoiceAmount(bytes:Buffer){
+  return withOcrLock(async()=>{
+    try{
+      const worker=await ocrWorker();
+      const variants=await invoiceVariants(bytes);
+      await worker.setParameters({tessedit_char_whitelist:''});
+      const fullOut=await worker.recognize(variants.full);
+      const labelled=parseAmountNearLabel(String(fullOut?.data?.text||''));
+      if(labelled!==null) return labelled;
+
+      await worker.setParameters({tessedit_char_whitelist:'0123456789,$. '});
+      for(const image of [variants.cropSoft,variants.cropNormal,variants.cropInverted]){
+        const out=await worker.recognize(image);
+        const amount=parseDigitCandidates(String(out?.data?.text||''));
+        if(amount!==null) return amount;
+      }
+    }catch(e){ console.error('invoice OCR',e); }
+    return null;
+  });
+}
+
+const employeePanelInstructions=`**تعليمات لوحة الموظفين**
+
+**بيع عِدّة**
+اضغط بيع عِدّة ثم أرسل صورة الفاتورة فقط. يقرأ البوت خانة MONEY AMOUNT ويسجل العملية تلقائيًا بنقطة واحدة.
+
+**تعديل مركبة**
+اضغط تعديل مركبة ثم أرسل صورة الفاتورة أولًا. بعد قراءة المبلغ سيطلب منك البوت صورة المركبة المعدلة، ثم يسجل العملية تلقائيًا بخمس نقاط.
+
+**دخول**
+اضغط دخول عند بداية دوامك.
+
+**خروج**
+اضغط خروج عند انتهاء دوامك.
+
+ترسل صور العمليات في نفس روم اللوحة، وبعد معالجتها يحذفها البوت تلقائيًا وتبقى نسخة الإثبات في اللوق فقط.`;
 
 function panelRow(){ return new ActionRowBuilder<ButtonBuilder>().addComponents(
-  new ButtonBuilder().setCustomId('service:tool').setLabel('بيع عِدّة').setEmoji('🧰').setStyle(ButtonStyle.Primary),
-  new ButtonBuilder().setCustomId('service:vehicle').setLabel('تعديل مركبة').setEmoji('🚗').setStyle(ButtonStyle.Primary),
-  new ButtonBuilder().setCustomId('attendance:in').setLabel('دخول').setEmoji('🟢').setStyle(ButtonStyle.Success),
-  new ButtonBuilder().setCustomId('attendance:out').setLabel('خروج').setEmoji('🔴').setStyle(ButtonStyle.Danger),
+  new ButtonBuilder().setCustomId('service:tool').setLabel('بيع عِدّة').setStyle(ButtonStyle.Primary),
+  new ButtonBuilder().setCustomId('service:vehicle').setLabel('تعديل مركبة').setStyle(ButtonStyle.Primary),
+  new ButtonBuilder().setCustomId('attendance:in').setLabel('دخول').setStyle(ButtonStyle.Success),
+  new ButtonBuilder().setCustomId('attendance:out').setLabel('خروج').setStyle(ButtonStyle.Danger),
 ); }
 function employeeRequestsRow(){ return new ActionRowBuilder<ButtonBuilder>().addComponents(
   new ButtonBuilder().setCustomId('requests:leave').setLabel('طلب إجازة').setEmoji('🏖️').setStyle(ButtonStyle.Primary),
@@ -278,7 +339,7 @@ async function setupPanels(interaction:any){
     else await ch.permissionOverwrites.set(perms).catch(()=>{});
     await setSetting(key,ch.id,interaction.user.id); channels[key]=ch;
   }
-  await upsertPanelMessage(channels.employee_panel_channel_id,'👷 لوحة الموظفين','اختر العملية المطلوبة. بيع العدة = **1 نقطة**، تعديل المركبة = **5 نقاط**.',[panelRow()]);
+  await upsertPanelMessage(channels.employee_panel_channel_id,'لوحة الموظفين',employeePanelInstructions,[panelRow()]);
   await upsertPanelMessage(channels.employee_requests_channel_id,'📨 طلبات الموظفين','من هنا تقدر تقدم إجازة أو استقالة، وإذا كنت في إجازة تقدر تستخدم زر **كسر إجازة** للعودة مباشرة.',[employeeRequestsRow()]);
   await upsertPanelMessage(channels.applicant_panel_channel_id,'📝 استكمال التقديم','إذا تم قبولك مبدئيًا من الموقع، اضغط الزر وسيسألك البوت عن **اسمك داخل اللعبة + رقم الجوال داخل اللعبة + Citizen ID**.',[applicantRow()]);
   await refreshControlPanels(channels);
@@ -315,31 +376,37 @@ async function refreshEmployeeStatusPanel(){
   const {data:leaves}=await db.from('leave_requests').select('id,ends_on,employees(discord_user_id,discord_username,game_name)').eq('status','approved').lte('starts_on',today).gte('ends_on',today).order('ends_on',{ascending:true});
   const active=(open??[]).slice(0,25).map((x:any)=>`${mention(x.employees?.discord_user_id)} — منذ <t:${Math.floor(new Date(x.clock_in).getTime()/1000)}:R>`).join('\n')||'لا يوجد';
   const onLeave=(leaves??[]).slice(0,25).map((x:any)=>`${mention(x.employees?.discord_user_id)} — تنتهي **${x.ends_on}**`).join('\n')||'لا يوجد';
-  const embed=new EmbedBuilder().setTitle('📍 حالة الموظفين').addFields(
-    {name:`🟢 داخل الدوام (${open?.length||0})`,value:active,inline:false},
-    {name:`🏖️ في إجازة (${leaves?.length||0})`,value:onLeave,inline:false},
+  const embed=new EmbedBuilder().setTitle('حالة الموظفين').addFields(
+    {name:`داخل الدوام (${open?.length||0})`,value:active,inline:false},
+    {name:`في إجازة (${leaves?.length||0})`,value:onLeave,inline:false},
   ).setTimestamp();
   const messages=await channel.messages.fetch({limit:50}).catch(()=>null);
-  const old=messages?.find((m:any)=>m.author.id===client.user!.id&&m.embeds?.[0]?.title==='📍 حالة الموظفين');
+  const old=messages?.find((m:any)=>m.author.id===client.user!.id&&m.embeds?.[0]?.title==='حالة الموظفين');
   if(old) await old.edit({embeds:[embed]}); else await channel.send({embeds:[embed]});
 }
 
-async function waitAttachment(channel:any,userId:string,prompt:string){
-  await channel.send({content:`<@${userId}> ${prompt}`});
-  const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&m.attachments.size>0,max:1,time:120000});
-  const m=c.first(); if(!m) throw new Error('انتهى الوقت بدون صورة'); return m.attachments.first()!.url;
+type CollectedImage={message:any;bytes:Buffer;filename:string;contentType?:string|null;originalUrl:string};
+function safeImageName(filename:string|undefined,prefix:string,contentType?:string|null){
+  const raw=String(filename||'').toLowerCase();
+  let ext=raw.endsWith('.png')?'png':raw.endsWith('.webp')?'webp':raw.endsWith('.jpeg')||raw.endsWith('.jpg')?'jpg':contentType?.includes('png')?'png':contentType?.includes('webp')?'webp':'jpg';
+  return `${prefix}.${ext}`;
 }
-async function askAmount(channel:any,userId:string,invoiceUrl:string){
-  const detected=await extractInvoiceAmount(invoiceUrl);
-  if(detected!==null){
-    await channel.send({content:`<@${userId}> قرأت من الفاتورة **MONEY AMOUNT = ${detected.toLocaleString()}**. اكتب **تأكيد** لاعتمادها، أو اكتب الرقم الصحيح إذا كانت القراءة غلط.`});
-    const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&(m.content.trim()==='تأكيد'||/^\d+(\.\d+)?$/.test(m.content.trim())),max:1,time:120000});
-    const m=c.first(); if(!m) throw new Error('انتهى الوقت بدون تأكيد المبلغ');
-    return m.content.trim()==='تأكيد'?detected:Number(m.content.trim());
-  }
-  await channel.send({content:`<@${userId}> ما قدرت أقرأ **MONEY AMOUNT** من الصورة. اكتب قيمة الفاتورة بالأرقام فقط.`});
-  const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&/^\d+(\.\d+)?$/.test(m.content.trim()),max:1,time:120000});
-  const m=c.first(); if(!m) throw new Error('لم يتم إدخال قيمة صحيحة'); return Number(m.content.trim());
+async function waitAttachment(channel:any,userId:string){
+  const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&m.attachments.size>0,max:1,time:120000});
+  const message=c.first(); if(!message) throw new Error('انتهى الوقت بدون صورة');
+  const attachment=message.attachments.first(); if(!attachment) throw new Error('لم يتم العثور على الصورة');
+  const response=await fetch(attachment.url); if(!response.ok) throw new Error('تعذر تحميل الصورة من Discord');
+  const bytes=Buffer.from(await response.arrayBuffer());
+  return {message,bytes,filename:attachment.name||'image.jpg',contentType:attachment.contentType,originalUrl:attachment.url} as CollectedImage;
+}
+async function deleteCollected(image?:CollectedImage|null){
+  if(!image?.message) return;
+  await image.message.delete().catch(()=>{});
+}
+async function readInvoiceOrFail(image:CollectedImage){
+  const detected=await extractInvoiceAmount(image.bytes);
+  if(detected===null) throw new Error('تعذر قراءة MONEY AMOUNT من الفاتورة. أرسل صورة أوضح للفاتورة وحاول مرة أخرى.');
+  return detected;
 }
 
 async function refreshStatsPanel(){
@@ -485,7 +552,7 @@ client.on(Events.InteractionCreate, async interaction=>{
     // Slash commands
     if(interaction.isChatInputCommand() && interaction.commandName==='panel'){
       await interaction.reply({content:'تم إرسال لوحة الموظفين.',ephemeral:true});
-      await interaction.channel?.send({embeds:[new EmbedBuilder().setTitle('👷 لوحة الموظفين').setDescription('اختر العملية المطلوبة.')],components:[panelRow()]}); return;
+      await interaction.channel?.send({embeds:[new EmbedBuilder().setTitle('لوحة الموظفين').setDescription(employeePanelInstructions)],components:[panelRow()]}); return;
     }
     if(interaction.isChatInputCommand() && interaction.commandName==='setup-logs'){
       await interaction.deferReply({ephemeral:true}); await setupLogs(interaction); return;
@@ -521,20 +588,39 @@ client.on(Events.InteractionCreate, async interaction=>{
     if(interaction.isButton() && interaction.customId.startsWith('service:')){
       const emp=await getEmployee(interaction.user.id); if(!emp) return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
       const leave=await activeLeaveForEmployee(emp.id); if(leave) return interaction.reply({content:'🏖️ أنت في إجازة حاليًا ولا يمكنك تسجيل عمليات حتى تعود.',ephemeral:true});
-      await interaction.reply({content:'بدأ تسجيل العملية. أكمل المطلوب في هذا الروم خلال دقيقتين.',ephemeral:true});
-      const ch:any=interaction.channel; if(!ch) throw new Error('الروم غير متاح');
-      const invoice=await waitAttachment(ch,interaction.user.id,'أرسل **صورة الفاتورة** الآن.');
-      const amount=await askAmount(ch,interaction.user.id,invoice);
       const kind=interaction.customId.split(':')[1];
-      if(kind==='tool'){
-        const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'tool_sale',points:1,invoice_amount:amount,invoice_image_url:invoice}); if(error) throw error;
-        const log=await getTextChannel('tool_sales_channel_id'); if(log) await log.send({embeds:[new EmbedBuilder().setTitle('🧰 بيع عِدّة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالقيمة: **$${amount.toLocaleString()}**\nالنقاط: **1**`).setImage(invoice).setTimestamp()]});
-        await ch.send({content:`✅ ${mention(interaction.user.id)} تم تسجيل بيع عِدّة — **1 نقطة** — قيمة الفاتورة: **$${amount.toLocaleString()}**`});
-      }else{
-        const vehicle=await waitAttachment(ch,interaction.user.id,'أرسل **صورة المركبة المعدلة** الآن.');
-        const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'vehicle_mod',points:5,invoice_amount:amount,invoice_image_url:invoice,vehicle_image_url:vehicle}); if(error) throw error;
-        const log=await getTextChannel('vehicle_mods_channel_id'); if(log) await log.send({embeds:[new EmbedBuilder().setTitle('🚗 تعديل مركبة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالقيمة: **$${amount.toLocaleString()}**\nالنقاط: **5**`).setImage(vehicle).setTimestamp()],files:[invoice]});
-        await ch.send({content:`✅ ${mention(interaction.user.id)} تم تسجيل تعديل المركبة — **5 نقاط** — قيمة الفاتورة: **$${amount.toLocaleString()}**`});
+      const ch:any=interaction.channel; if(!ch) throw new Error('الروم غير متاح');
+      await interaction.reply({content:kind==='tool'?'أرسل صورة الفاتورة في هذا الروم خلال دقيقتين. سيتم تسجيل العملية تلقائيًا بعد قراءة MONEY AMOUNT.':'أرسل صورة الفاتورة أولًا في هذا الروم خلال دقيقتين. بعد قراءتها سيطلب منك البوت صورة المركبة.',ephemeral:true});
+
+      let invoice:CollectedImage|null=null;
+      let vehicle:CollectedImage|null=null;
+      try{
+        invoice=await waitAttachment(ch,interaction.user.id);
+        const amount=await readInvoiceOrFail(invoice);
+
+        if(kind==='tool'){
+          const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'tool_sale',points:1,invoice_amount:amount,invoice_image_url:invoice.originalUrl}); if(error) throw error;
+          const log=await getTextChannel('tool_sales_channel_id');
+          if(log){
+            const invoiceName=safeImageName(invoice.filename,'invoice',invoice.contentType);
+            await log.send({embeds:[new EmbedBuilder().setTitle('بيع عِدّة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالقيمة: **$${amount.toLocaleString()}**\nالنقاط: **1**`).setImage(`attachment://${invoiceName}`).setTimestamp()],files:[{attachment:invoice.bytes,name:invoiceName}]});
+          }
+          await interaction.followUp({content:`تم تسجيل بيع عِدّة تلقائيًا. قيمة الفاتورة: **$${amount.toLocaleString()}** — النقاط: **1**.`,ephemeral:true});
+        }else{
+          await interaction.followUp({content:`تمت قراءة قيمة الفاتورة: **$${amount.toLocaleString()}**. أرسل الآن صورة المركبة المعدلة في هذا الروم خلال دقيقتين.`,ephemeral:true});
+          vehicle=await waitAttachment(ch,interaction.user.id);
+          const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'vehicle_mod',points:5,invoice_amount:amount,invoice_image_url:invoice.originalUrl,vehicle_image_url:vehicle.originalUrl}); if(error) throw error;
+          const log=await getTextChannel('vehicle_mods_channel_id');
+          if(log){
+            const invoiceName=safeImageName(invoice.filename,'invoice',invoice.contentType);
+            const vehicleName=safeImageName(vehicle.filename,'vehicle',vehicle.contentType);
+            await log.send({embeds:[new EmbedBuilder().setTitle('تعديل مركبة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالقيمة: **$${amount.toLocaleString()}**\nالنقاط: **5**`).setImage(`attachment://${vehicleName}`).setTimestamp()],files:[{attachment:invoice.bytes,name:invoiceName},{attachment:vehicle.bytes,name:vehicleName}]});
+          }
+          await interaction.followUp({content:`تم تسجيل تعديل المركبة تلقائيًا. قيمة الفاتورة: **$${amount.toLocaleString()}** — النقاط: **5**.`,ephemeral:true});
+        }
+      }finally{
+        await deleteCollected(invoice);
+        await deleteCollected(vehicle);
       }
       await refreshStatsPanel(); await refreshControlPanels(); return;
     }
