@@ -26,7 +26,14 @@ export async function currentAccess(){
   const db=adminDb();
   const {data:employee}=await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle();
   if(employee && (!employee.is_active || employee.employment_status!=='active')) return {user,discordId,role:null as StaffRole|null,employee,locked:true};
-  const live=await liveDiscordRole(discordId);
+  let live=await liveDiscordRole(discordId);
+  // الموظف في إجازة تُسحب منه رتبة Employee في Discord، لكن يبقى قادرًا على دخول موقعه
+  // ومشاهدة حالة الإجازة وكسرها. نتحقق من الإجازة الفعالة من قاعدة البيانات.
+  if(!live && employee){
+    const today=new Date().toISOString().slice(0,10);
+    const {data:leave}=await db.from('leave_requests').select('id').eq('employee_id',employee.id).eq('status','approved').lte('starts_on',today).gte('ends_on',today).limit(1).maybeSingle();
+    if(leave) live='employee';
+  }
   if(!live) return {user,discordId,role:null as StaffRole|null,employee,locked:false};
   let record=employee;
   if(!record && live!=='employee'){

@@ -57,7 +57,7 @@ class QueryBuilder implements PromiseLike<Result>{
   private relationSelect(){
     const m=this.selected.match(/employees\(([^)]+)\)/);
     if(!m) return null;
-    if(!['attendance','leave_requests'].includes(this.table)) return null;
+    if(!['attendance','leave_requests','resignation_requests'].includes(this.table)) return null;
     const cols=m[1].split(',').map(x=>x.trim()).filter(Boolean);
     const base=this.selected.startsWith('*,')?'t.*':this.selected.split(',employees(')[0].split(',').map(x=>`t.${ident(x.trim())}`).join(', ');
     const pairs=cols.flatMap(c=>[`'${c}'`,`e.${ident(c)}`]).join(', ');

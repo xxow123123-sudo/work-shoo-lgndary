@@ -26,6 +26,10 @@ do $$ begin
   create type public.leave_status as enum ('pending','approved','rejected','cancelled');
 exception when duplicate_object then null; end $$;
 
+do $$ begin
+  create type public.resignation_status as enum ('pending','approved','rejected');
+exception when duplicate_object then null; end $$;
+
 create table if not exists public.employees (
   id uuid primary key default gen_random_uuid(),
   discord_user_id text unique not null,
@@ -135,6 +139,19 @@ create table if not exists public.leave_requests (
   updated_at timestamptz not null default now()
 );
 
+alter table public.leave_requests add column if not exists ended_early_at timestamptz;
+alter table public.leave_requests add column if not exists auto_returned_at timestamptz;
+
+create table if not exists public.resignation_requests (
+  id uuid primary key default gen_random_uuid(),
+  employee_id uuid not null references public.employees(id) on delete cascade,
+  reason text,
+  status public.resignation_status not null default 'pending',
+  reviewed_by_discord_id text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.weekly_cycles (
   id uuid primary key default gen_random_uuid(),
   starts_at timestamptz not null,
@@ -153,7 +170,20 @@ create table if not exists public.weekly_snapshots (
   vehicle_mods integer not null default 0,
   points integer not null default 0,
   invoice_total numeric(14,2) not null default 0,
+  resources_quantity integer not null default 0,
   created_at timestamptz not null default now(),
+  unique(cycle_id, employee_id)
+);
+
+alter table public.weekly_snapshots add column if not exists resources_quantity integer not null default 0;
+
+create table if not exists public.weekly_resource_deliveries (
+  id uuid primary key default gen_random_uuid(),
+  cycle_id uuid not null references public.weekly_cycles(id) on delete cascade,
+  employee_id uuid not null references public.employees(id) on delete cascade,
+  quantity integer not null check (quantity >= 0),
+  received_by_discord_id text not null,
+  delivered_at timestamptz not null default now(),
   unique(cycle_id, employee_id)
 );
 

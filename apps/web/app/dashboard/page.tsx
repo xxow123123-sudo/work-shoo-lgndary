@@ -10,14 +10,18 @@ export default async function Dashboard(){
   const a=await requireRole('employee');
   if(a.locked) return <StaffShell role="employee" name={a.employee?.game_name||a.employee?.discord_username} section="ACCOUNT"><div className="locked-state"><span>LOCKED</span><h1>الحساب الوظيفي موقوف</h1><p>{a.employee?.status_reason||'راجع الإدارة لمعرفة حالة حسابك.'}</p></div></StaffShell>;
   const db=adminDb(); const employee=a.employee;
-  const [{data:week},{data:life},{data:warnings},{data:leaves},{data:openShift},{data:recent}]=await Promise.all([
+  const [{data:week},{data:life},{data:warnings},{data:leaves},{data:openShift},{data:recent},{data:modSetting},{data:cycle}]=await Promise.all([
     db.from('current_week_stats').select('*').eq('employee_id',employee.id).maybeSingle(),
     db.from('lifetime_stats').select('*').eq('employee_id',employee.id).maybeSingle(),
     db.from('warnings').select('*').eq('employee_id',employee.id).order('created_at',{ascending:false}).limit(8),
     db.from('leave_requests').select('*').eq('employee_id',employee.id).order('created_at',{ascending:false}).limit(8),
     db.from('attendance').select('*').eq('employee_id',employee.id).is('clock_out',null).maybeSingle(),
     db.from('service_records').select('*').eq('employee_id',employee.id).order('created_at',{ascending:false}).limit(8),
+    db.from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key','weekly_vehicle_mod_requirement').maybeSingle(),
+    db.from('weekly_cycles').select('*').eq('is_current',true).limit(1).maybeSingle(),
   ]);
+  const modRequirement=Number(modSetting?.value||0)||0;
+  const {data:delivery}=cycle?await db.from('weekly_resource_deliveries').select('*').eq('cycle_id',cycle.id).eq('employee_id',employee.id).maybeSingle():{data:null as any};
   const name=employee.game_name||employee.discord_username||a.discordId;
   return <StaffShell role={a.role} name={name} section="EMPLOYEE">
     <section className="staff-hero compact-hero">
@@ -34,9 +38,15 @@ export default async function Dashboard(){
 
     <section className="metric-grid metric-grid-4">
       <article className="metric-card featured"><span>نقاط الأسبوع</span><strong>{week?.points||0}</strong><small>بيع عدة = 1 • تعديل = 5</small></article>
-      <article className="metric-card"><span>تعديلات المركبات</span><strong>{week?.vehicle_mods||0}</strong><small>هذا الأسبوع</small></article>
+      <article className="metric-card"><span>تعديلات المركبات</span><strong>{week?.vehicle_mods||0}{modRequirement?` / ${modRequirement}`:''}</strong><small>{modRequirement&&Number(week?.vehicle_mods||0)>=modRequirement?'المتطلب مكتمل':'هذا الأسبوع'}</small></article>
       <article className="metric-card"><span>بيع العدة</span><strong>{week?.tool_sales||0}</strong><small>هذا الأسبوع</small></article>
       <article className="metric-card"><span>قيمة الفواتير</span><strong>${Number(week?.invoice_total||0).toLocaleString()}</strong><small>هذا الأسبوع</small></article>
+    </section>
+
+    <section className="panel-card">
+      <div className="panel-head"><div><span>WEEKLY CHECKLIST</span><h2>متطلبات الأسبوع</h2></div></div>
+      <div className="lifetime-stat"><span>تعديلات المركبات المطلوبة</span><strong>{modRequirement?`${week?.vehicle_mods||0} / ${modRequirement}`:'غير محدد'}</strong></div>
+      <div className="lifetime-stat"><span>تسليم الموارد</span><strong>{delivery?`تم التسليم: ${delivery.quantity}`:'لم يتم التسليم'}</strong></div>
     </section>
 
     <section className="dashboard-grid two-one">

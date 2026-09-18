@@ -8,17 +8,22 @@ export default async function Admin(){
   const a=await requireRole('boss');
   if(a.locked) return <StaffShell role={a.role} name={a.employee?.game_name||a.employee?.discord_username} section="ADMIN"><div className="locked-state"><span>LOCKED</span><h1>الحساب موقوف</h1></div></StaffShell>;
   const db=adminDb();
-  const [{data:week},{data:life},{data:employees},{data:setting},{count:online},{data:cycles}]=await Promise.all([
+  const [{data:week},{data:life},{data:employees},{data:setting},{data:modSetting},{count:online},{data:cycles}]=await Promise.all([
     db.from('current_week_stats').select('*').order('points',{ascending:false}),
     db.from('lifetime_stats').select('*').order('points',{ascending:false}),
     db.from('employees').select('*').order('discord_username'),
     db.from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key','recruitment_open').maybeSingle(),
+    db.from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key','weekly_vehicle_mod_requirement').maybeSingle(),
     db.from('attendance').select('*',{count:'exact',head:true}).is('clock_out',null),
     db.from('weekly_cycles').select('*').order('starts_at',{ascending:false}).limit(8),
   ]);
   const total=(week||[]).reduce((x:any,r:any)=>({tool:x.tool+(r.tool_sales||0),mods:x.mods+(r.vehicle_mods||0),points:x.points+(r.points||0),money:x.money+Number(r.invoice_total||0)}),{tool:0,mods:0,points:0,money:0});
   const recruitmentOpen=setting?.value===undefined?true:setting.value==='true';
+  const modRequirement=Number(modSetting?.value||0)||0;
   const active=(employees||[]).filter((e:any)=>e.is_active&&e.employment_status==='active');
+  const current=(cycles||[]).find((c:any)=>c.is_current);
+  const {data:deliveries}=current?await db.from('weekly_resource_deliveries').select('*').eq('cycle_id',current.id):{data:[] as any[]};
+  const deliveryMap=new Map((deliveries||[]).map((d:any)=>[d.employee_id,d.quantity]));
   const name=a.employee?.game_name||a.employee?.discord_username||(a.role==='owner'?'Owner':'Boss');
   return <StaffShell role={a.role} name={name} section="MANAGEMENT">
     <section className="staff-hero compact-hero"><div><span className={`work-status ${recruitmentOpen?'online':'offline'}`}>{recruitmentOpen?'التقديم مفتوح':'التقديم مغلق'}</span><h1>لوحة الإدارة العليا</h1><p>صورة كاملة عن الورشة، الأداء الأسبوعي، الموظفين والتحكم الإداري.</p></div><div className="profile-chip"><span>الموظفون النشطون</span><strong>{active.length}</strong><small>{online||0} داخل الدوام الآن</small></div></section>
@@ -49,6 +54,14 @@ export default async function Admin(){
       <div className="cycle-strip">{cycles?.map((c:any)=><div className={c.is_current?'current':''} key={c.id}><span>{c.is_current?'الأسبوع الحالي':'أسبوع مغلق'}</span><strong>{new Date(c.starts_at).toLocaleDateString('ar-SA')}</strong><small>{c.is_current?'مستمر الآن':c.ends_at?`أغلق ${new Date(c.ends_at).toLocaleDateString('ar-SA')}`:'مغلق'}</small></div>)}</div>
     </section>
 
-    <AdminControls employees={(employees||[]).filter((e:any)=>e.role==='employee'||e.role==='hr')} recruitmentOpen={recruitmentOpen}/>
+    <section className="panel-card">
+      <div className="panel-head"><div><span>WEEKLY REQUIREMENTS</span><h2>متطلبات الموظفين هذا الأسبوع</h2></div><b>شرط التعديلات: {modRequirement}</b></div>
+      <div className="application-table">
+        <div className="application-row header"><span>الموظف</span><span>التعديلات</span><span>الموارد</span><span>الحالة</span></div>
+        {active.map((e:any)=>{const w=(week||[]).find((x:any)=>x.employee_id===e.id);const mods=w?.vehicle_mods||0;const qty=deliveryMap.get(e.id);return <div className="application-row" key={e.id}><strong>{e.game_name||e.discord_username||e.discord_user_id}</strong><span>{mods} / {modRequirement||'—'}</span><span>{qty!==undefined?`سلّم ${qty}`:'لم يسلّم'}</span><span className={`status-text ${(!modRequirement||mods>=modRequirement)&&qty!==undefined?'accepted':'pending'}`}>{(!modRequirement||mods>=modRequirement)&&qty!==undefined?'مكتمل':'ناقص'}</span></div>})}
+      </div>
+    </section>
+
+    <AdminControls employees={(employees||[]).filter((e:any)=>e.role==='employee'||e.role==='hr')} recruitmentOpen={recruitmentOpen} modRequirement={modRequirement}/>
   </StaffShell>;
 }

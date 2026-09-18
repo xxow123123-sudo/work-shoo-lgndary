@@ -17,7 +17,9 @@ import {
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
 } from 'discord.js';
+import { createWorker } from 'tesseract.js';
 
 const required = ['DATABASE_URL','DISCORD_BOT_TOKEN','DISCORD_CLIENT_ID','DISCORD_GUILD_ID'];
 for (const key of required) if (!process.env[key]) throw new Error(`Missing environment variable: ${key}`);
@@ -81,11 +83,61 @@ async function latestApplication(discordId:string){
 function mention(id?:string|null){ return id ? `<@${id}>` : 'غير معروف'; }
 function short(s:any,n=1000){ const x=String(s??'-'); return x.length>n ? x.slice(0,n-1)+'…' : x; }
 
+async function currentCycle(){
+  const {data}=await db.from('weekly_cycles').select('*').eq('is_current',true).limit(1).maybeSingle();
+  return data;
+}
+async function weeklyModRequirement(){
+  const raw=await getSetting('weekly_vehicle_mod_requirement');
+  const n=Number(raw||0); return Number.isFinite(n)&&n>0?Math.floor(n):0;
+}
+async function leaveRoleId(){ return await getSetting('leave_role_id'); }
+async function ensureLeaveRole(guild:any){
+  const saved=await leaveRoleId();
+  if(saved){ const r=await guild.roles.fetch(saved).catch(()=>null); if(r) return r; }
+  const existing=guild.roles.cache.find((r:any)=>r.name==='إجازة');
+  const role=existing || await guild.roles.create({name:'إجازة',reason:'Legendary leave system'});
+  await setSetting('leave_role_id',role.id,'system'); return role;
+}
+async function activeLeaveForEmployee(employeeId:string){
+  const today=new Date().toISOString().slice(0,10);
+  const {data}=await db.from('leave_requests').select('*').eq('employee_id',employeeId).eq('status','approved').lte('starts_on',today).gte('ends_on',today).order('created_at',{ascending:false}).limit(1).maybeSingle();
+  return data;
+}
+let ocrWorkerPromise:Promise<any>|null=null;
+async function ocrWorker(){
+  if(!ocrWorkerPromise) ocrWorkerPromise=createWorker('eng');
+  return ocrWorkerPromise;
+}
+async function extractInvoiceAmount(imageUrl:string){
+  try{
+    const r=await fetch(imageUrl); if(!r.ok) return null;
+    const bytes=Buffer.from(await r.arrayBuffer());
+    const worker=await ocrWorker(); const out=await worker.recognize(bytes);
+    const text=String(out?.data?.text||'').replace(/\r/g,' ');
+    const patterns=[
+      /MONEY\s*AMOUNT[\s\S]{0,35}?([0-9][0-9, .]{2,})/i,
+      /AMOUNT[\s\S]{0,20}?([0-9][0-9, .]{2,})/i,
+    ];
+    for(const p of patterns){
+      const m=text.match(p); if(!m) continue;
+      const raw=m[1].replace(/[ ,]/g,'').replace(/\.(?=\d{3}(?:\D|$))/g,'');
+      const n=Number(raw); if(Number.isFinite(n)&&n>=0) return n;
+    }
+  }catch(e){ console.error('invoice OCR',e); }
+  return null;
+}
+
 function panelRow(){ return new ActionRowBuilder<ButtonBuilder>().addComponents(
   new ButtonBuilder().setCustomId('service:tool').setLabel('بيع عِدّة').setEmoji('🧰').setStyle(ButtonStyle.Primary),
   new ButtonBuilder().setCustomId('service:vehicle').setLabel('تعديل مركبة').setEmoji('🚗').setStyle(ButtonStyle.Primary),
   new ButtonBuilder().setCustomId('attendance:in').setLabel('دخول').setEmoji('🟢').setStyle(ButtonStyle.Success),
   new ButtonBuilder().setCustomId('attendance:out').setLabel('خروج').setEmoji('🔴').setStyle(ButtonStyle.Danger),
+); }
+function employeeRequestsRow(){ return new ActionRowBuilder<ButtonBuilder>().addComponents(
+  new ButtonBuilder().setCustomId('requests:leave').setLabel('طلب إجازة').setEmoji('🏖️').setStyle(ButtonStyle.Primary),
+  new ButtonBuilder().setCustomId('requests:resign').setLabel('طلب استقالة').setEmoji('📄').setStyle(ButtonStyle.Danger),
+  new ButtonBuilder().setCustomId('requests:break_leave').setLabel('كسر إجازة').setEmoji('🔓').setStyle(ButtonStyle.Success),
 ); }
 function applicantRow(){ return new ActionRowBuilder<ButtonBuilder>().addComponents(
   new ButtonBuilder().setCustomId('applicant:complete').setLabel('استكمال بيانات التقديم').setEmoji('📝').setStyle(ButtonStyle.Success),
@@ -96,6 +148,9 @@ function hrRows(){ return [
     new ButtonBuilder().setCustomId('hr:forceout').setLabel('خروج إجباري').setEmoji('🚪').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('hr:warning').setLabel('إنذار موظف').setEmoji('⚠️').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('hr:edit').setLabel('تعديل معلومات موظف').setEmoji('✏️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('hr:hire').setLabel('توظيف شخص').setEmoji('➕').setStyle(ButtonStyle.Success),
+  ),
+  new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId('hr:lift_rejection').setLabel('رفع رفض متقدم').setEmoji('♻️').setStyle(ButtonStyle.Success),
   ),
 ]; }
@@ -107,7 +162,17 @@ function adminRows(){ return [
     new ButtonBuilder().setCustomId('admin:reactivate').setLabel('إعادة تفعيل موظف').setEmoji('✅').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('admin:close_week').setLabel('إغلاق الأسبوع').setEmoji('📦').setStyle(ButtonStyle.Primary),
   ),
+  new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('admin:set_mod_requirement').setLabel('شرط التعديلات').setEmoji('🚗').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('admin:resource_delivery').setLabel('تسجيل تسليم موارد').setEmoji('📦').setStyle(ButtonStyle.Primary),
+  ),
 ]; }
+
+function userPicker(customId:string,placeholder='اختر الموظف'){
+  return new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+    new UserSelectMenuBuilder().setCustomId(customId).setPlaceholder(placeholder).setMinValues(1).setMaxValues(1),
+  );
+}
 
 function staffOverwrites(guild:any, includeHr=true){
   const arr:any[]=[{id:guild.roles.everyone.id,deny:[PermissionFlagsBits.ViewChannel]}];
@@ -125,6 +190,12 @@ function employeeReadOnlyOverwrites(guild:any){
   if(process.env.DISCORD_OWNER_USER_ID) arr.push({id:process.env.DISCORD_OWNER_USER_ID,allow:staff});
   if(process.env.DISCORD_BOSS_ROLE_ID) arr.push({id:process.env.DISCORD_BOSS_ROLE_ID,allow:staff});
   if(process.env.DISCORD_HR_ROLE_ID) arr.push({id:process.env.DISCORD_HR_ROLE_ID,allow:staff});
+  return arr;
+}
+function employeeRequestsOverwrites(guild:any,leaveRole:string){
+  const arr=employeeReadOnlyOverwrites(guild);
+  const read=[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.ReadMessageHistory];
+  if(leaveRole) arr.push({id:leaveRole,allow:read,deny:[PermissionFlagsBits.SendMessages]});
   return arr;
 }
 function applicantOverwrites(guild:any){
@@ -157,6 +228,7 @@ async function setupLogs(interaction:any){
     ['warnings_channel_id','⚠️・الانذارات','public'],
     ['decisions_channel_id','📢・القرارات','public'],
     ['stats_channel_id','📊・نشاط-الاسبوع','public'],
+    ['resources_channel_id','📦・تسليم-الموارد','staff'],
   ] as const;
   const linked:string[]=[];
   for(const [key,name,access] of defs){
@@ -189,9 +261,11 @@ async function setupPanels(interaction:any){
   if(!category || category.type!==ChannelType.GuildCategory) category=guild.channels.cache.find((c:any)=>c.type===ChannelType.GuildCategory&&c.name==='🧭・لوحات-النظام');
   if(!category) category=await guild.channels.create({name:'🧭・لوحات-النظام',type:ChannelType.GuildCategory});
   await setSetting('panels_category_id',category.id,interaction.user.id);
+  const leaveRole=await ensureLeaveRole(guild);
 
   const defs:any[]=[
     ['employee_panel_channel_id','👷・لوحة-الموظفين',employeeReadOnlyOverwrites(guild)],
+    ['employee_requests_channel_id','📨・طلبات-الموظفين',employeeRequestsOverwrites(guild,leaveRole.id)],
     ['applicant_panel_channel_id','📝・استكمال-التقديم',applicantOverwrites(guild)],
     ['hr_panel_channel_id','👥・لوحة-hr',staffOverwrites(guild,true)],
     ['admin_panel_channel_id','👑・لوحة-الادارة-العليا',staffOverwrites(guild,false)],
@@ -201,13 +275,16 @@ async function setupPanels(interaction:any){
     let ch:any=null; const id=await getSetting(key); if(id) ch=await guild.channels.fetch(id).catch(()=>null);
     if(!ch || ch.type!==ChannelType.GuildText) ch=guild.channels.cache.find((c:any)=>c.type===ChannelType.GuildText&&c.parentId===category.id&&c.name===name);
     if(!ch) ch=await guild.channels.create({name,type:ChannelType.GuildText,parent:category.id,permissionOverwrites:perms});
+    else await ch.permissionOverwrites.set(perms).catch(()=>{});
     await setSetting(key,ch.id,interaction.user.id); channels[key]=ch;
   }
   await upsertPanelMessage(channels.employee_panel_channel_id,'👷 لوحة الموظفين','اختر العملية المطلوبة. بيع العدة = **1 نقطة**، تعديل المركبة = **5 نقاط**.',[panelRow()]);
+  await upsertPanelMessage(channels.employee_requests_channel_id,'📨 طلبات الموظفين','من هنا تقدر تقدم إجازة أو استقالة، وإذا كنت في إجازة تقدر تستخدم زر **كسر إجازة** للعودة مباشرة.',[employeeRequestsRow()]);
   await upsertPanelMessage(channels.applicant_panel_channel_id,'📝 استكمال التقديم','إذا تم قبولك مبدئيًا من الموقع، اضغط الزر وسيسألك البوت عن **اسمك داخل اللعبة + رقم الجوال داخل اللعبة + Citizen ID**.',[applicantRow()]);
   await refreshControlPanels(channels);
+  await refreshEmployeeStatusPanel();
   await audit(interaction.user.id,'setup_panels','guild',guild.id,Object.fromEntries(Object.entries(channels).map(([k,v]:any)=>[k,v.id])));
-  await interaction.editReply(`✅ تم إنشاء وربط اللوحات.\n👷 <#${channels.employee_panel_channel_id.id}>  📝 <#${channels.applicant_panel_channel_id.id}>  👥 <#${channels.hr_panel_channel_id.id}>  👑 <#${channels.admin_panel_channel_id.id}>`);
+  await interaction.editReply(`✅ تم إنشاء وربط اللوحات.\n👷 <#${channels.employee_panel_channel_id.id}>  📨 <#${channels.employee_requests_channel_id.id}>  📝 <#${channels.applicant_panel_channel_id.id}>  👥 <#${channels.hr_panel_channel_id.id}>  👑 <#${channels.admin_panel_channel_id.id}>`);
 }
 
 async function refreshControlPanels(preloaded?:Record<string,any>){
@@ -222,9 +299,29 @@ async function refreshControlPanels(preloaded?:Record<string,any>){
   if(admin){
     const open=await isRecruitmentOpen();
     const {data:rows}=await db.from('current_week_stats').select('*').order('points',{ascending:false});
+    const requirement=await weeklyModRequirement();
+    const cycle=await currentCycle();
+    let deliveredCount=0;
+    if(cycle){ const {count}=await db.from('weekly_resource_deliveries').select('*',{count:'exact',head:true}).eq('cycle_id',cycle.id); deliveredCount=count||0; }
     const total=(rows??[]).reduce((a:any,r:any)=>({points:a.points+(r.points||0),money:a.money+Number(r.invoice_total||0),ops:a.ops+(r.tool_sales||0)+(r.vehicle_mods||0)}),{points:0,money:0,ops:0});
-    await upsertPanelMessage(admin,'👑 لوحة الإدارة العليا',`التقديم: **${open?'🟢 مفتوح':'🔴 مغلق'}**\n⭐ نقاط الأسبوع: **${total.points}**\n🧾 خدمات الأسبوع: **${total.ops}**\n💰 قيمة فواتير الأسبوع: **$${total.money.toLocaleString()}**`,adminRows());
+    await upsertPanelMessage(admin,'👑 لوحة الإدارة العليا',`التقديم: **${open?'🟢 مفتوح':'🔴 مغلق'}**\n⭐ نقاط الأسبوع: **${total.points}**\n🧾 خدمات الأسبوع: **${total.ops}**\n💰 قيمة فواتير الأسبوع: **$${total.money.toLocaleString()}**\n🚗 شرط تعديل المركبات لكل موظف: **${requirement||'غير محدد'}**\n📦 سلّموا الموارد هذا الأسبوع: **${deliveredCount}**`,adminRows());
   }
+}
+
+async function refreshEmployeeStatusPanel(){
+  const channel=await getTextChannel('employee_panel_channel_id'); if(!channel) return;
+  const {data:open}=await db.from('attendance').select('id,clock_in,employees(discord_user_id,discord_username,game_name)').is('clock_out',null).order('clock_in',{ascending:true});
+  const today=new Date().toISOString().slice(0,10);
+  const {data:leaves}=await db.from('leave_requests').select('id,ends_on,employees(discord_user_id,discord_username,game_name)').eq('status','approved').lte('starts_on',today).gte('ends_on',today).order('ends_on',{ascending:true});
+  const active=(open??[]).slice(0,25).map((x:any)=>`${mention(x.employees?.discord_user_id)} — منذ <t:${Math.floor(new Date(x.clock_in).getTime()/1000)}:R>`).join('\n')||'لا يوجد';
+  const onLeave=(leaves??[]).slice(0,25).map((x:any)=>`${mention(x.employees?.discord_user_id)} — تنتهي **${x.ends_on}**`).join('\n')||'لا يوجد';
+  const embed=new EmbedBuilder().setTitle('📍 حالة الموظفين').addFields(
+    {name:`🟢 داخل الدوام (${open?.length||0})`,value:active,inline:false},
+    {name:`🏖️ في إجازة (${leaves?.length||0})`,value:onLeave,inline:false},
+  ).setTimestamp();
+  const messages=await channel.messages.fetch({limit:50}).catch(()=>null);
+  const old=messages?.find((m:any)=>m.author.id===client.user!.id&&m.embeds?.[0]?.title==='📍 حالة الموظفين');
+  if(old) await old.edit({embeds:[embed]}); else await channel.send({embeds:[embed]});
 }
 
 async function waitAttachment(channel:any,userId:string,prompt:string){
@@ -232,8 +329,15 @@ async function waitAttachment(channel:any,userId:string,prompt:string){
   const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&m.attachments.size>0,max:1,time:120000});
   const m=c.first(); if(!m) throw new Error('انتهى الوقت بدون صورة'); return m.attachments.first()!.url;
 }
-async function askAmount(channel:any,userId:string){
-  await channel.send({content:`<@${userId}> اكتب قيمة الفاتورة بالأرقام فقط. (قراءة الصورة تلقائيًا ستُربط في مرحلة OCR)`});
+async function askAmount(channel:any,userId:string,invoiceUrl:string){
+  const detected=await extractInvoiceAmount(invoiceUrl);
+  if(detected!==null){
+    await channel.send({content:`<@${userId}> قرأت من الفاتورة **MONEY AMOUNT = ${detected.toLocaleString()}**. اكتب **تأكيد** لاعتمادها، أو اكتب الرقم الصحيح إذا كانت القراءة غلط.`});
+    const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&(m.content.trim()==='تأكيد'||/^\d+(\.\d+)?$/.test(m.content.trim())),max:1,time:120000});
+    const m=c.first(); if(!m) throw new Error('انتهى الوقت بدون تأكيد المبلغ');
+    return m.content.trim()==='تأكيد'?detected:Number(m.content.trim());
+  }
+  await channel.send({content:`<@${userId}> ما قدرت أقرأ **MONEY AMOUNT** من الصورة. اكتب قيمة الفاتورة بالأرقام فقط.`});
   const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&/^\d+(\.\d+)?$/.test(m.content.trim()),max:1,time:120000});
   const m=c.first(); if(!m) throw new Error('لم يتم إدخال قيمة صحيحة'); return Number(m.content.trim());
 }
@@ -329,8 +433,10 @@ async function closeCurrentWeek(actor:string){
   const {data:cycle,error:cycleErr}=await db.from('weekly_cycles').select('*').eq('is_current',true).limit(1).maybeSingle();
   if(cycleErr) throw cycleErr; if(!cycle) throw new Error('لا يوجد أسبوع حالي.');
   const {data:rows,error:rowsErr}=await db.from('current_week_stats').select('*'); if(rowsErr) throw rowsErr;
+  const {data:deliveries}=await db.from('weekly_resource_deliveries').select('*').eq('cycle_id',cycle.id);
+  const deliveryMap=new Map((deliveries??[]).map((x:any)=>[x.employee_id,Number(x.quantity||0)]));
   if(rows?.length){
-    const snapshots=rows.map((r:any)=>({cycle_id:cycle.id,employee_id:r.employee_id,tool_sales:r.tool_sales||0,vehicle_mods:r.vehicle_mods||0,points:r.points||0,invoice_total:r.invoice_total||0}));
+    const snapshots=rows.map((r:any)=>({cycle_id:cycle.id,employee_id:r.employee_id,tool_sales:r.tool_sales||0,vehicle_mods:r.vehicle_mods||0,points:r.points||0,invoice_total:r.invoice_total||0,resources_quantity:deliveryMap.get(r.employee_id)||0}));
     const {error}=await db.from('weekly_snapshots').upsert(snapshots,{onConflict:'cycle_id,employee_id'}); if(error) throw error;
   }
   const now=new Date().toISOString();
@@ -340,12 +446,30 @@ async function closeCurrentWeek(actor:string){
   await refreshStatsPanel(); await refreshControlPanels();
 }
 
+async function processExpiredLeaves(){
+  const guild=client.guilds.cache.get(process.env.DISCORD_GUILD_ID!); if(!guild) return;
+  const y=new Date(); y.setUTCDate(y.getUTCDate()-1); const yesterday=y.toISOString().slice(0,10);
+  const {data:rows}=await db.from('leave_requests').select('*,employees(discord_user_id)').eq('status','approved').is('auto_returned_at',null).lte('ends_on',yesterday);
+  if(!rows?.length) return;
+  const lr=await ensureLeaveRole(guild);
+  for(const leave of rows){
+    const discordId=leave.employees?.discord_user_id; if(!discordId) continue;
+    const member=await guild.members.fetch(discordId).catch(()=>null);
+    if(member) await member.roles.remove(lr.id).catch(()=>{}); if(member&&employeeRoleId()) await member.roles.add(employeeRoleId()!).catch(()=>{});
+    await db.from('leave_requests').update({auto_returned_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',leave.id);
+    const log=await getTextChannel('hr_records_channel_id'); if(log) await log.send(`⏰ **انتهاء إجازة تلقائي**\nالموظف: ${mention(discordId)}\nتمت إعادة رتبة الموظف تلقائيًا.`);
+    await audit('system','leave_auto_return','leave_request',leave.id,{discord_user_id:discordId});
+  }
+  await refreshEmployeeStatusPanel();
+}
+
 client.once(Events.ClientReady, async c=>{
   console.log(`Logged in as ${c.user.tag}`);
   const rest=new REST({version:'10'}).setToken(process.env.DISCORD_BOT_TOKEN!);
   await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID!,process.env.DISCORD_GUILD_ID!),{body:commands});
   if((await getSetting('recruitment_open'))===undefined) await setSetting('recruitment_open','true','system');
-  await refreshStatsPanel(); await refreshControlPanels();
+  await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); await processExpiredLeaves();
+  setInterval(()=>{ void processExpiredLeaves().catch(console.error); },60_000);
 });
 
 client.on(Events.GuildMemberAdd, async member=>{
@@ -370,11 +494,12 @@ client.on(Events.InteractionCreate, async interaction=>{
       await interaction.deferReply({ephemeral:true}); await setupPanels(interaction); return;
     }
 
-    if(!interaction.isButton() && !interaction.isModalSubmit()) return;
+    if(!interaction.isButton() && !interaction.isModalSubmit() && !interaction.isUserSelectMenu()) return;
 
     // Employee attendance
     if(interaction.isButton() && interaction.customId.startsWith('attendance:')){
       const emp=await getEmployee(interaction.user.id); if(!emp) return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
+      const leave=await activeLeaveForEmployee(emp.id); if(leave) return interaction.reply({content:'🏖️ أنت في إجازة حاليًا. استخدم زر **كسر إجازة** إذا تريد العودة قبل انتهائها.',ephemeral:true});
       const action=interaction.customId.split(':')[1];
       if(action==='in'){
         const {data:open}=await db.from('attendance').select('id').eq('employee_id',emp.id).is('clock_out',null).maybeSingle();
@@ -389,16 +514,17 @@ client.on(Events.InteractionCreate, async interaction=>{
         const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`🔴 ${mention(interaction.user.id)} سجّل **خروج**.`);
         await interaction.reply({content:'🔴 تم تسجيل خروجك.',ephemeral:true});
       }
-      await refreshStatsPanel(); await refreshControlPanels(); return;
+      await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); return;
     }
 
     // Employee services
     if(interaction.isButton() && interaction.customId.startsWith('service:')){
       const emp=await getEmployee(interaction.user.id); if(!emp) return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
+      const leave=await activeLeaveForEmployee(emp.id); if(leave) return interaction.reply({content:'🏖️ أنت في إجازة حاليًا ولا يمكنك تسجيل عمليات حتى تعود.',ephemeral:true});
       await interaction.reply({content:'بدأ تسجيل العملية. أكمل المطلوب في هذا الروم خلال دقيقتين.',ephemeral:true});
       const ch:any=interaction.channel; if(!ch) throw new Error('الروم غير متاح');
       const invoice=await waitAttachment(ch,interaction.user.id,'أرسل **صورة الفاتورة** الآن.');
-      const amount=await askAmount(ch,interaction.user.id);
+      const amount=await askAmount(ch,interaction.user.id,invoice);
       const kind=interaction.customId.split(':')[1];
       if(kind==='tool'){
         const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'tool_sale',points:1,invoice_amount:amount,invoice_image_url:invoice}); if(error) throw error;
@@ -411,6 +537,86 @@ client.on(Events.InteractionCreate, async interaction=>{
         await ch.send({content:`✅ ${mention(interaction.user.id)} تم تسجيل تعديل المركبة — **5 نقاط** — قيمة الفاتورة: **$${amount.toLocaleString()}**`});
       }
       await refreshStatsPanel(); await refreshControlPanels(); return;
+    }
+
+    // Employee requests: leave / resignation / break leave
+    if(interaction.isButton() && interaction.customId.startsWith('requests:')){
+      const emp=await getEmployee(interaction.user.id,false); if(!emp||!emp.is_active||emp.employment_status!=='active') return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
+      const action=interaction.customId.split(':')[1];
+      if(action==='leave'){
+        const modal=new ModalBuilder().setCustomId('request_leave_submit').setTitle('طلب إجازة');
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('starts_on').setLabel('تاريخ البداية YYYY-MM-DD').setPlaceholder('2026-09-20').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('days').setLabel('عدد الأيام').setPlaceholder('3').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('السبب').setStyle(TextInputStyle.Paragraph).setRequired(false)),
+        ); return interaction.showModal(modal);
+      }
+      if(action==='resign'){
+        const modal=new ModalBuilder().setCustomId('request_resign_submit').setTitle('طلب استقالة');
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الاستقالة').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+        return interaction.showModal(modal);
+      }
+      if(action==='break_leave'){
+        const leave=await activeLeaveForEmployee(emp.id); if(!leave) return interaction.reply({content:'ليس لديك إجازة فعالة حاليًا.',ephemeral:true});
+        await db.from('leave_requests').update({status:'cancelled',ended_early_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',leave.id);
+        const member=await interaction.guild?.members.fetch(interaction.user.id).catch(()=>null); const lrole=await leaveRoleId();
+        if(member&&lrole) await member.roles.remove(lrole).catch(()=>{}); if(member&&employeeRoleId()) await member.roles.add(employeeRoleId()!).catch(()=>{});
+        await audit(interaction.user.id,'leave_broken','leave_request',leave.id,{});
+        const log=await getTextChannel('hr_records_channel_id'); if(log) await log.send(`🔓 **كسر إجازة**\nالموظف: ${mention(interaction.user.id)}\nالعودة: الآن`);
+        await interaction.reply({content:'✅ تم كسر الإجازة وإرجاع رتبة الموظف وصلاحياتك.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
+      }
+    }
+
+    if(interaction.isModalSubmit() && interaction.customId==='request_leave_submit'){
+      const emp=await getEmployee(interaction.user.id); if(!emp) return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
+      const starts=interaction.fields.getTextInputValue('starts_on').trim(); const days=Number(interaction.fields.getTextInputValue('days').trim()); const reason=interaction.fields.getTextInputValue('reason').trim();
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(starts)||!Number.isInteger(days)||days<1||days>60) return interaction.reply({content:'تأكد من التاريخ وعدد الأيام (1 إلى 60).',ephemeral:true});
+      const startDate=new Date(starts+'T00:00:00Z'); if(Number.isNaN(startDate.getTime())) return interaction.reply({content:'تاريخ البداية غير صحيح.',ephemeral:true});
+      const endDate=new Date(startDate); endDate.setUTCDate(endDate.getUTCDate()+days-1); const ends=endDate.toISOString().slice(0,10);
+      const {data:leave,error}=await db.from('leave_requests').insert({employee_id:emp.id,starts_on:starts,ends_on:ends,reason:reason||null}).select('*').single(); if(error) throw error;
+      const hr=await getTextChannel('hr_records_channel_id'); if(hr){
+        const buttons=new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`leave_accept:${leave.id}`).setLabel('قبول الإجازة').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`leave_reject:${leave.id}`).setLabel('رفض').setStyle(ButtonStyle.Danger),
+        );
+        await hr.send({content:`<@&${process.env.DISCORD_HR_ROLE_ID}> ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('🏖️ طلب إجازة').setDescription(`الموظف: ${mention(interaction.user.id)}\nمن: **${starts}**\nإلى: **${ends}**\nالمدة: **${days} يوم**\nالسبب: ${reason||'—'}`).setTimestamp()],components:[buttons]});
+      }
+      await interaction.reply({content:'✅ تم إرسال طلب الإجازة إلى HR.',ephemeral:true}); return;
+    }
+
+    if(interaction.isModalSubmit() && interaction.customId==='request_resign_submit'){
+      const emp=await getEmployee(interaction.user.id); if(!emp) return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
+      const reason=interaction.fields.getTextInputValue('reason').trim();
+      const {data:req,error}=await db.from('resignation_requests').insert({employee_id:emp.id,reason}).select('*').single(); if(error) throw error;
+      const hr=await getTextChannel('hr_records_channel_id'); if(hr){
+        const buttons=new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`resign_accept:${req.id}`).setLabel('قبول الاستقالة').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId(`resign_reject:${req.id}`).setLabel('رفض').setStyle(ButtonStyle.Secondary),
+        );
+        await hr.send({content:`<@&${process.env.DISCORD_HR_ROLE_ID}> ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('📄 طلب استقالة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالسبب: **${reason}**`).setTimestamp()],components:[buttons]});
+      }
+      await interaction.reply({content:'✅ تم إرسال طلب الاستقالة إلى الإدارة.',ephemeral:true}); return;
+    }
+
+    if(interaction.isButton() && (interaction.customId.startsWith('leave_accept:')||interaction.customId.startsWith('leave_reject:'))){
+      if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
+      const [kind,id]=interaction.customId.split(':'); const {data:leave}=await db.from('leave_requests').select('*,employees(discord_user_id)').eq('id',id).maybeSingle(); if(!leave) return interaction.reply({content:'طلب الإجازة غير موجود.',ephemeral:true});
+      if(kind==='leave_reject'){ await db.from('leave_requests').update({status:'rejected',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id); await interaction.reply({content:'❌ تم رفض الإجازة.',ephemeral:true}); return; }
+      await db.from('leave_requests').update({status:'approved',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id);
+      const discordId=leave.employees?.discord_user_id; const member=discordId?await interaction.guild?.members.fetch(discordId).catch(()=>null):null; const lrole=await ensureLeaveRole(interaction.guild);
+      if(member&&employeeRoleId()) await member.roles.remove(employeeRoleId()!).catch(()=>{}); if(member&&lrole) await member.roles.add(lrole.id).catch(()=>{});
+      const {data:emp}=discordId?await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle():{data:null}; if(emp){ const {data:shift}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle(); if(shift) await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:'بدء إجازة'}).eq('id',shift.id); }
+      await audit(interaction.user.id,'leave_approved','leave_request',id,{discord_user_id:discordId}); await interaction.reply({content:'✅ تم قبول الإجازة وسحب رتبة الموظف وإعطاء رتبة إجازة.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
+    }
+
+    if(interaction.isButton() && (interaction.customId.startsWith('resign_accept:')||interaction.customId.startsWith('resign_reject:'))){
+      if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
+      const [kind,id]=interaction.customId.split(':'); const {data:req}=await db.from('resignation_requests').select('*,employees(discord_user_id)').eq('id',id).maybeSingle(); if(!req) return interaction.reply({content:'طلب الاستقالة غير موجود.',ephemeral:true});
+      if(kind==='resign_reject'){ await db.from('resignation_requests').update({status:'rejected',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id); return interaction.reply({content:'تم رفض الاستقالة.',ephemeral:true}); }
+      const discordId=req.employees?.discord_user_id; await db.from('resignation_requests').update({status:'approved',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id);
+      if(discordId){ const {data:emp}=await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle(); if(emp) await db.from('employees').update({is_active:false,employment_status:'terminated',status_reason:'استقالة معتمدة',status_changed_by_discord_id:interaction.user.id,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',emp.id); const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(member&&employeeRoleId()) await member.roles.remove(employeeRoleId()!).catch(()=>{}); const lr=await leaveRoleId(); if(member&&lr) await member.roles.remove(lr).catch(()=>{}); }
+      const decisions=await getTextChannel('decisions_channel_id'); if(decisions&&discordId) await decisions.send(`📄 **اعتماد استقالة**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}`);
+      await interaction.reply({content:'✅ تم اعتماد الاستقالة وإيقاف الحساب الوظيفي.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
     }
 
     // Applicant completion button
@@ -503,26 +709,21 @@ client.on(Events.InteractionCreate, async interaction=>{
         return interaction.reply({content:lines.length?`**🟢 المسجلون دخول الآن (${open?.length||0})**\n${lines.join('\n')}`:'لا يوجد موظفون داخل الدوام الآن.',ephemeral:true});
       }
       if(action==='forceout'){
-        const modal=new ModalBuilder().setCustomId('hr_forceout_submit').setTitle('خروج إجباري');
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للموظف').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الخروج الإجباري').setStyle(TextInputStyle.Paragraph).setRequired(true)),
-        ); return interaction.showModal(modal);
+        return interaction.reply({content:'اختر الموظف:',components:[userPicker('hr_select:forceout')],ephemeral:true});
       }
       if(action==='warning'){
-        const modal=new ModalBuilder().setCustomId('hr_warning_submit').setTitle('إنذار موظف');
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للموظف').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الإنذار').setStyle(TextInputStyle.Paragraph).setRequired(true)),
-        ); return interaction.showModal(modal);
+        return interaction.reply({content:'اختر الموظف:',components:[userPicker('hr_select:warning')],ephemeral:true});
       }
       if(action==='edit'){
-        const modal=new ModalBuilder().setCustomId('hr_edit_submit').setTitle('تعديل معلومات موظف');
+        return interaction.reply({content:'اختر الموظف:',components:[userPicker('hr_select:edit')],ephemeral:true});
+      }
+      if(action==='hire'){
+        const modal=new ModalBuilder().setCustomId('hr_hire_submit').setTitle('توظيف شخص');
         modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للموظف').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('game_name').setLabel('اسم اللعبة الجديد (اتركه فارغًا للإبقاء)').setStyle(TextInputStyle.Short).setRequired(false)),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('game_phone').setLabel('رقم الجوال الجديد (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('citizen_id').setLabel('Citizen ID الجديد (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('game_name').setLabel('الاسم داخل اللعبة').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('game_phone').setLabel('رقم الجوال داخل اللعبة').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('citizen_id').setLabel('Citizen ID').setStyle(TextInputStyle.Short).setRequired(true)),
         ); return interaction.showModal(modal);
       }
       if(action==='lift_rejection'){
@@ -532,34 +733,69 @@ client.on(Events.InteractionCreate, async interaction=>{
       }
     }
 
-    if(interaction.isModalSubmit() && interaction.customId==='hr_forceout_submit'){
+    if(interaction.isUserSelectMenu() && interaction.customId.startsWith('hr_select:')){
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
-      const discordId=interaction.fields.getTextInputValue('discord_id').trim(); const reason=interaction.fields.getTextInputValue('reason').trim();
+      const action=interaction.customId.split(':')[1]; const discordId=interaction.values[0]; const emp=await getEmployee(discordId,false);
+      if(!emp) return interaction.reply({content:'الشخص المختار غير مسجل كموظف في النظام.',ephemeral:true});
+      if(action==='forceout'){
+        const modal=new ModalBuilder().setCustomId(`hr_forceout_submit:${discordId}`).setTitle('خروج إجباري');
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الخروج الإجباري').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+        return interaction.showModal(modal);
+      }
+      if(action==='warning'){
+        const modal=new ModalBuilder().setCustomId(`hr_warning_submit:${discordId}`).setTitle('إنذار موظف');
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الإنذار').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+        return interaction.showModal(modal);
+      }
+      if(action==='edit'){
+        const modal=new ModalBuilder().setCustomId(`hr_edit_submit:${discordId}`).setTitle('تعديل معلومات موظف');
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('game_name').setLabel('اسم اللعبة الجديد (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('game_phone').setLabel('رقم الجوال الجديد (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('citizen_id').setLabel('Citizen ID الجديد (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
+        ); return interaction.showModal(modal);
+      }
+    }
+
+    if(interaction.isModalSubmit() && interaction.customId.startsWith('hr_forceout_submit:')){
+      if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
+      const discordId=interaction.customId.split(':')[1]; const reason=interaction.fields.getTextInputValue('reason').trim();
       const emp=await getEmployee(discordId,false); if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
       const {data:shift}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle(); if(!shift) return interaction.reply({content:'الموظف ليس داخل الدوام حاليًا.',ephemeral:true});
       await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:reason}).eq('id',shift.id);
       const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`🚪 **خروج إجباري**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}\nالسبب: ${reason}`);
       await audit(interaction.user.id,'forced_clock_out','employee',emp.id,{reason});
-      await interaction.reply({content:'✅ تم تسجيل الخروج الإجباري.',ephemeral:true}); await refreshStatsPanel(); await refreshControlPanels(); return;
+      await interaction.reply({content:'✅ تم تسجيل الخروج الإجباري.',ephemeral:true}); await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); return;
     }
-    if(interaction.isModalSubmit() && interaction.customId==='hr_warning_submit'){
+    if(interaction.isModalSubmit() && interaction.customId.startsWith('hr_warning_submit:')){
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
-      const discordId=interaction.fields.getTextInputValue('discord_id').trim(); const reason=interaction.fields.getTextInputValue('reason').trim();
+      const discordId=interaction.customId.split(':')[1]; const reason=interaction.fields.getTextInputValue('reason').trim();
       const emp=await getEmployee(discordId,false); if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
       await db.from('warnings').insert({employee_id:emp.id,reason,issued_by_discord_id:interaction.user.id});
       const warn=await getTextChannel('warnings_channel_id'); if(warn) await warn.send({content:`${mention(discordId)} ${employeeRoleId()?`<@&${employeeRoleId()}>`:''}`,embeds:[new EmbedBuilder().setTitle('⚠️ إنذار موظف').setDescription(`الموظف: ${mention(discordId)}\nالسبب: **${reason}**\nبواسطة: ${mention(interaction.user.id)}`).setTimestamp()]});
       await audit(interaction.user.id,'employee_warning','employee',emp.id,{reason});
       await interaction.reply({content:'✅ تم تسجيل الإنذار وإرساله لروم الإنذارات.',ephemeral:true}); return;
     }
-    if(interaction.isModalSubmit() && interaction.customId==='hr_edit_submit'){
+    if(interaction.isModalSubmit() && interaction.customId.startsWith('hr_edit_submit:')){
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
-      const discordId=interaction.fields.getTextInputValue('discord_id').trim(); const emp=await getEmployee(discordId,false); if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
+      const discordId=interaction.customId.split(':')[1]; const emp=await getEmployee(discordId,false); if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
       const update:any={updated_at:new Date().toISOString()};
       for(const key of ['game_name','game_phone','citizen_id']){ const v=interaction.fields.getTextInputValue(key).trim(); if(v) update[key]=v; }
       await db.from('employees').update(update).eq('id',emp.id);
       const hr=await getTextChannel('hr_records_channel_id'); if(hr) await hr.send(`✏️ تم تعديل بيانات ${mention(discordId)} بواسطة ${mention(interaction.user.id)}.`);
       await audit(interaction.user.id,'employee_profile_edit','employee',emp.id,{before:{game_name:emp.game_name,game_phone:emp.game_phone,citizen_id:emp.citizen_id},after:update});
       await interaction.reply({content:'✅ تم تعديل معلومات الموظف.',ephemeral:true}); return;
+    }
+    if(interaction.isModalSubmit() && interaction.customId==='hr_hire_submit'){
+      if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
+      const discordId=interaction.fields.getTextInputValue('discord_id').trim(); if(!/^\d{15,25}$/.test(discordId)) return interaction.reply({content:'Discord ID غير صحيح.',ephemeral:true});
+      const gameName=interaction.fields.getTextInputValue('game_name').trim(), gamePhone=interaction.fields.getTextInputValue('game_phone').trim(), citizenId=interaction.fields.getTextInputValue('citizen_id').trim();
+      const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(!member) return interaction.reply({content:'هذا الشخص غير موجود داخل السيرفر حاليًا.',ephemeral:true});
+      await db.from('employees').upsert({discord_user_id:discordId,discord_username:member.user.username,role:'employee',game_name:gameName,game_phone:gamePhone,citizen_id:citizenId,profile_complete:true,is_active:true,employment_status:'active',status_reason:null,status_changed_by_discord_id:interaction.user.id,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()},{onConflict:'discord_user_id'});
+      if(employeeRoleId()) await member.roles.add(employeeRoleId()!).catch(()=>{}); if(applicantRoleId()) await member.roles.remove(applicantRoleId()!).catch(()=>{});
+      const hr=await getTextChannel('hr_records_channel_id'); if(hr) await hr.send({embeds:[new EmbedBuilder().setTitle('➕ توظيف مباشر').setDescription(`الموظف: ${mention(discordId)}\nالاسم: **${gameName}**\nالجوال: **${gamePhone}**\nCitizen ID: **${citizenId}**\nوظّفه: ${mention(interaction.user.id)}`).setTimestamp()]});
+      await audit(interaction.user.id,'employee_manual_hire','employee',discordId,{game_name:gameName,game_phone:gamePhone,citizen_id:citizenId});
+      await interaction.reply({content:'✅ تم توظيف الشخص وإعطاؤه رتبة الموظف وتسجيل بياناته.',ephemeral:true}); await refreshControlPanels(); return;
     }
     if(interaction.isModalSubmit() && interaction.customId==='hr_lift_rejection_submit'){
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
@@ -582,16 +818,18 @@ client.on(Events.InteractionCreate, async interaction=>{
         await interaction.reply({content:open?'🟢 تم فتح التقديم في الموقع.':'🔴 تم إغلاق التقديم في الموقع.',ephemeral:true}); await refreshControlPanels(); return;
       }
       if(action==='terminate'){
-        const modal=new ModalBuilder().setCustomId('admin_terminate_submit').setTitle('فصل موظف');
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للموظف').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الفصل').setStyle(TextInputStyle.Paragraph).setRequired(true)),
-        ); return interaction.showModal(modal);
+        return interaction.reply({content:'اختر الموظف الذي تريد فصله:',components:[userPicker('admin_select:terminate')],ephemeral:true});
       }
       if(action==='reactivate'){
-        const modal=new ModalBuilder().setCustomId('admin_reactivate_submit').setTitle('إعادة تفعيل موظف');
-        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للموظف').setStyle(TextInputStyle.Short).setRequired(true)));
+        return interaction.reply({content:'اختر الموظف الذي تريد إعادة تفعيله:',components:[userPicker('admin_select:reactivate')],ephemeral:true});
+      }
+      if(action==='set_mod_requirement'){
+        const modal=new ModalBuilder().setCustomId('admin_mod_requirement_submit').setTitle('شرط تعديلات المركبات');
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('count').setLabel('عدد التعديلات المطلوبة أسبوعيًا').setPlaceholder('مثال: 6').setStyle(TextInputStyle.Short).setRequired(true)));
         return interaction.showModal(modal);
+      }
+      if(action==='resource_delivery'){
+        return interaction.reply({content:'اختر الموظف الذي سلّم الموارد:',components:[userPicker('admin_select:resource')],ephemeral:true});
       }
       if(action==='close_week'){
         const row=new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -605,23 +843,53 @@ client.on(Events.InteractionCreate, async interaction=>{
         await interaction.deferUpdate(); await closeCurrentWeek(interaction.user.id); return interaction.editReply({content:'✅ تم إغلاق الأسبوع وحفظ التقرير وبدء أسبوع جديد.',components:[]});
       }
     }
-    if(interaction.isModalSubmit() && interaction.customId==='admin_terminate_submit'){
+
+    if(interaction.isUserSelectMenu() && interaction.customId.startsWith('admin_select:')){
       if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
-      const discordId=interaction.fields.getTextInputValue('discord_id').trim(); const reason=interaction.fields.getTextInputValue('reason').trim(); const emp=await getEmployee(discordId,false);
+      const action=interaction.customId.split(':')[1]; const discordId=interaction.values[0]; const emp=await getEmployee(discordId,false);
+      if(!emp) return interaction.reply({content:'الشخص المختار غير مسجل كموظف في النظام.',ephemeral:true});
+      if(action==='terminate'){
+        const modal=new ModalBuilder().setCustomId(`admin_terminate_submit:${discordId}`).setTitle('فصل موظف');
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب الفصل').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+        return interaction.showModal(modal);
+      }
+      if(action==='reactivate'){
+        await db.from('employees').update({is_active:true,employment_status:'active',status_reason:null,status_changed_by_discord_id:interaction.user.id,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',emp.id);
+        const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(member&&employeeRoleId()) await member.roles.add(employeeRoleId()!).catch(()=>{}); const lr=await leaveRoleId(); if(member&&lr) await member.roles.remove(lr).catch(()=>{});
+        await audit(interaction.user.id,'employee_reactivated','employee',emp.id,{}); await interaction.reply({content:'✅ تم إعادة تفعيل الموظف وإرجاع صلاحياته بدون تصفير سجله.',ephemeral:true}); await refreshControlPanels(); return;
+      }
+      if(action==='resource'){
+        const modal=new ModalBuilder().setCustomId(`admin_resource_submit:${discordId}`).setTitle('تسجيل تسليم موارد');
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('quantity').setLabel('الكمية').setPlaceholder('مثال: 150').setStyle(TextInputStyle.Short).setRequired(true)));
+        return interaction.showModal(modal);
+      }
+    }
+
+    if(interaction.isModalSubmit() && interaction.customId.startsWith('admin_terminate_submit:')){
+      if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
+      const discordId=interaction.customId.split(':')[1]; const reason=interaction.fields.getTextInputValue('reason').trim(); const emp=await getEmployee(discordId,false);
       if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
       await db.from('employees').update({is_active:false,employment_status:'terminated',status_reason:reason,status_changed_by_discord_id:interaction.user.id,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',emp.id);
       const {data:shift}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle();
       if(shift) await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:'فصل الموظف: '+reason}).eq('id',shift.id);
       const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(member&&employeeRoleId()) await member.roles.remove(employeeRoleId()!).catch(()=>{});
+      const lr=await leaveRoleId(); if(member&&lr) await member.roles.remove(lr).catch(()=>{});
       const log=await getTextChannel('admin_logs_channel_id'); if(log) await log.send(`⛔ **فصل موظف**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}\nالسبب: ${reason}`);
-      await audit(interaction.user.id,'employee_terminated','employee',emp.id,{reason}); await interaction.reply({content:'⛔ تم فصل الموظف وقفل صلاحياته، مع إبقاء جميع إحصائياته القديمة.',ephemeral:true}); await refreshStatsPanel(); await refreshControlPanels(); return;
+      await audit(interaction.user.id,'employee_terminated','employee',emp.id,{reason}); await interaction.reply({content:'⛔ تم فصل الموظف وقفل صلاحياته، مع إبقاء جميع إحصائياته القديمة.',ephemeral:true}); await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); return;
     }
-    if(interaction.isModalSubmit() && interaction.customId==='admin_reactivate_submit'){
+    if(interaction.isModalSubmit() && interaction.customId==='admin_mod_requirement_submit'){
       if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
-      const discordId=interaction.fields.getTextInputValue('discord_id').trim(); const emp=await getEmployee(discordId,false); if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
-      await db.from('employees').update({is_active:true,employment_status:'active',status_reason:null,status_changed_by_discord_id:interaction.user.id,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',emp.id);
-      const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(member&&employeeRoleId()) await member.roles.add(employeeRoleId()!).catch(()=>{});
-      await audit(interaction.user.id,'employee_reactivated','employee',emp.id,{}); await interaction.reply({content:'✅ تم إعادة تفعيل الموظف وإرجاع صلاحياته بدون تصفير سجله.',ephemeral:true}); await refreshControlPanels(); return;
+      const count=Number(interaction.fields.getTextInputValue('count').trim()); if(!Number.isInteger(count)||count<0||count>100) return interaction.reply({content:'اكتب رقم صحيح من 0 إلى 100.',ephemeral:true});
+      await setSetting('weekly_vehicle_mod_requirement',String(count),interaction.user.id); await audit(interaction.user.id,'weekly_mod_requirement','guild',interaction.guildId||'',{count});
+      await interaction.reply({content:`✅ تم تحديد المتطلب الأسبوعي: **${count} تعديل مركبة لكل موظف**.`,ephemeral:true}); await refreshControlPanels(); return;
+    }
+    if(interaction.isModalSubmit() && interaction.customId.startsWith('admin_resource_submit:')){
+      if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
+      const discordId=interaction.customId.split(':')[1]; const quantity=Number(interaction.fields.getTextInputValue('quantity').trim()); if(!Number.isInteger(quantity)||quantity<0) return interaction.reply({content:'الكمية غير صحيحة.',ephemeral:true});
+      const emp=await getEmployee(discordId,false); const cycle=await currentCycle(); if(!emp||!cycle) return interaction.reply({content:'تعذر إيجاد الموظف أو الأسبوع الحالي.',ephemeral:true});
+      await db.from('weekly_resource_deliveries').upsert({cycle_id:cycle.id,employee_id:emp.id,quantity,received_by_discord_id:interaction.user.id,delivered_at:new Date().toISOString()},{onConflict:'cycle_id,employee_id'});
+      const log=await getTextChannel('resources_channel_id'); if(log) await log.send({embeds:[new EmbedBuilder().setTitle('📦 تسليم موارد أسبوعي').setDescription(`الموظف: ${mention(discordId)}\nالكمية: **${quantity}**\nاستلمها: ${mention(interaction.user.id)}`).setTimestamp()]});
+      await audit(interaction.user.id,'weekly_resources_received','employee',emp.id,{quantity,cycle_id:cycle.id}); await interaction.reply({content:`✅ تم تسجيل أن ${mention(discordId)} سلّم **${quantity}**.`,ephemeral:true}); await refreshControlPanels(); return;
     }
 
   }catch(e:any){

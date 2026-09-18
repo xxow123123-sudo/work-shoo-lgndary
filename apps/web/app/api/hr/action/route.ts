@@ -10,6 +10,10 @@ async function createInvite(){
   const r=await fetch(`https://discord.com/api/v10/channels/${channel}/invites`,{method:'POST',headers:{authorization:`Bot ${process.env.DISCORD_BOT_TOKEN}`,'content-type':'application/json'},body:JSON.stringify({max_age:604800,max_uses:1,unique:true})}).catch(()=>null);
   if(!r?.ok) return process.env.DISCORD_INVITE_URL||null; const j=await r.json(); return `https://discord.gg/${j.code}`;
 }
+async function setting(key:string){
+  const {data}=await adminDb().from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key',key).maybeSingle();
+  return data?.value||null;
+}
 
 export async function POST(req:Request){
   try{
@@ -39,9 +43,29 @@ export async function POST(req:Request){
       const invite=await createInvite(); await db.from('applications').update({status:'preaccepted',discord_invite_url:invite,updated_at:new Date().toISOString()}).eq('id',app.id);
       await updateDiscordMemberRole(body.discord_id,process.env.DISCORD_APPLICANT_ROLE_ID,true); await audit(actor,'application_rejection_lifted','application',app.id,{}); return NextResponse.json({ok:true});
     }
+    if(action==='hire'){
+      const discordId=String(body.discord_id||'').trim(); if(!/^\d{15,25}$/.test(discordId)) throw new Error('Discord ID غير صحيح');
+      const {data:existing}=await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle();
+      const payload={discord_user_id:discordId,discord_username:existing?.discord_username||discordId,role:'employee',game_name:String(body.game_name||'').trim(),game_phone:String(body.game_phone||'').trim(),citizen_id:String(body.citizen_id||'').trim(),profile_complete:true,is_active:true,employment_status:'active',status_reason:null,status_changed_by_discord_id:actor,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()};
+      if(!payload.game_name||!payload.game_phone||!payload.citizen_id) throw new Error('أكمل جميع بيانات الموظف');
+      await db.from('employees').upsert(payload,{onConflict:'discord_user_id'});
+      await updateDiscordMemberRole(discordId,process.env.DISCORD_EMPLOYEE_ROLE_ID||process.env.DISCORD_EMPLOYEES_ROLE_ID,true);
+      await updateDiscordMemberRole(discordId,process.env.DISCORD_APPLICANT_ROLE_ID,false);
+      await sendDiscord('hr_records_channel_id',{embeds:[{title:'➕ توظيف مباشر',description:`الموظف: <@${discordId}>\nالاسم: **${payload.game_name}**\nالجوال: **${payload.game_phone}**\nCitizen ID: **${payload.citizen_id}**\nوظّفه: <@${actor}>`,timestamp:new Date().toISOString()}]});
+      await audit(actor,'employee_manual_hire','employee',discordId,payload); return NextResponse.json({ok:true});
+    }
     if(action==='leave_review'){
       const {data:leave}=await db.from('leave_requests').select('*,employees(discord_user_id)').eq('id',body.id).maybeSingle(); if(!leave) throw new Error('طلب الإجازة غير موجود');
       const status=body.decision==='approve'?'approved':'rejected'; await db.from('leave_requests').update({status,reviewed_by_discord_id:actor,updated_at:new Date().toISOString()}).eq('id',leave.id);
+      if(status==='approved'){
+        const discordId=leave.employees?.discord_user_id;
+        if(discordId){
+          await updateDiscordMemberRole(discordId,process.env.DISCORD_EMPLOYEE_ROLE_ID||process.env.DISCORD_EMPLOYEES_ROLE_ID,false);
+          const leaveRole=await setting('leave_role_id'); if(leaveRole) await updateDiscordMemberRole(discordId,leaveRole,true);
+          const {data:emp}=await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle();
+          if(emp){ const {data:shift}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle(); if(shift) await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:actor,forced_out_reason:'بدء إجازة'}).eq('id',shift.id); }
+        }
+      }
       await audit(actor,`leave_${status}`,'leave_request',leave.id,{}); return NextResponse.json({ok:true});
     }
     return NextResponse.json({error:'إجراء غير معروف'},{status:400});
