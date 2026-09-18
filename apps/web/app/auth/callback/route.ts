@@ -1,6 +1,12 @@
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { clearOauthStateCookie, setSessionCookie, verifyOauthState } from '../../../lib/auth';
 import { auditEvent } from '../../../lib/audit';
+import { adminDb } from '../../../lib/database';
+
+function attachApplicationCookie(response:NextResponse, applicationId:string){
+  response.cookies.set('legendary_app',applicationId,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/',maxAge:60*60*24*365});
+}
 
 export async function GET(req:Request){
   const url=new URL(req.url);
@@ -38,9 +44,28 @@ export async function GET(req:Request){
     return response;
   }
   const user:any=await userRes.json();
-  await auditEvent(user.id,'website_login','discord_user',user.id,{username:user.username,display_name:user.global_name||user.username},'الموقع');
-  const response=NextResponse.redirect(`${site}/portal`);
+  const db=adminDb();
+  const store=await cookies();
+  const cookieAppId=store.get('legendary_app')?.value;
+
+  // إذا فتح المتقدم OAuth من صفحة طلب موجود، لازم حساب Discord يطابق الـ ID الذي قدم به.
+  if(cookieAppId){
+    const {data:cookieApp}=await db.from('applications').select('id,discord_user_id,status').eq('id',cookieAppId).maybeSingle();
+    if(cookieApp && cookieApp.discord_user_id!==user.id){
+      const response=NextResponse.redirect(`${site}/apply/status?error=discord_mismatch`);
+      clearOauthStateCookie(response);
+      return response;
+    }
+  }
+
+  const {data:application}=await db.from('applications').select('id,status,discord_user_id').eq('discord_user_id',user.id).order('created_at',{ascending:false}).limit(1).maybeSingle();
+  const applicantStates=['pending','preaccepted','profile_submitted','interview','rejected'];
+  const target=application && applicantStates.includes(application.status) ? '/apply/status' : '/portal';
+
+  await auditEvent(user.id,'website_login','discord_user',user.id,{username:user.username,display_name:user.global_name||user.username,application_status:application?.status||null},'الموقع');
+  const response=NextResponse.redirect(`${site}${target}`);
   setSessionCookie(response,user);
+  if(application?.id) attachApplicationCookie(response,application.id);
   clearOauthStateCookie(response);
   return response;
 }

@@ -340,3 +340,12 @@ body:before{
 
 @media(max-width:980px){.staff-app-shell{grid-template-columns:1fr}.staff-sidebar{position:relative;height:auto;border-left:0;border-bottom:1px solid #20252a;padding:12px 14px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px}.sidebar-brand{border:0;padding:0}.sidebar-brand div span{display:none}.sidebar-nav{display:flex;overflow:auto;padding:0;gap:5px}.sidebar-nav a{white-space:nowrap;padding:9px 10px}.sidebar-bottom{margin:0;border:0;padding:0}.sidebar-user{grid-template-columns:36px 1fr}.sidebar-user img,.sidebar-avatar-fallback{width:36px;height:36px}.sidebar-user b,.sidebar-logout{display:none}.staff-topbar{top:0}.staff-directory{grid-template-columns:1fr}.staff-requirements>div{grid-template-columns:1fr}.timeline-row{grid-template-columns:60px 1fr}.timeline-action{grid-column:2}.staff-app-shell .staff-content{width:min(100% - 24px,1280px)}}
 @media(max-width:620px){.staff-sidebar{grid-template-columns:1fr}.sidebar-brand{justify-content:center}.sidebar-nav{justify-content:flex-start}.sidebar-bottom{display:none}.staff-topbar{height:68px;padding:0 14px}.topbar-profile div{display:none}.staff-app-shell .staff-content{padding-top:18px}.requirement-values{grid-template-columns:1fr 1fr}.requirement-values .status-text{grid-column:1/-1}.timeline-row{grid-template-columns:1fr}.timeline-action,.timeline-row .discord-person{grid-column:1}.timeline-time{order:3}.application-row .discord-person{grid-column:1/-1}}
+
+/* Applicant Discord linking v12 */
+.status-actions{display:flex;justify-content:center;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+.status-action-card .status-actions .silver-btn{margin-top:0}
+.status-secondary-btn{display:inline-flex;align-items:center;justify-content:center;min-height:46px;padding:0 21px;border:1px solid #343a40;border-radius:11px;background:#0b0e11;color:#d4d8dc;font-weight:750;font-size:12px;transition:.18s}
+.status-secondary-btn:hover{border-color:#5a626b;background:#111519;color:#fff;transform:translateY(-1px)}
+.discord-linked-chip{display:inline-flex;align-items:center;gap:7px;margin-top:13px;padding:7px 10px;border:1px solid #30363c;border-radius:999px;color:#aeb5bc;background:rgba(10,13,15,.76);font-size:10px;direction:ltr}
+.discord-linked-chip span{width:7px;height:7px;border-radius:50%;background:#cfd3d7;box-shadow:0 0 11px rgba(207,211,215,.35)}
+@media(max-width:560px){.status-actions{display:grid}.status-actions>a{width:100%}}
