@@ -1,6 +1,13 @@
 import Link from 'next/link';
+import { redirect } from 'next/navigation';
+import { currentSession } from '../../lib/auth';
 
-export default function Login(){
+export const dynamic='force-dynamic';
+
+export default async function Login(){
+  const session=await currentSession();
+  if(session) redirect('/portal');
+
   return <main className="employee-login-page">
     <div className="login-nav">
       <Link className="login-brand" href="/">
@@ -16,7 +23,7 @@ export default function Login(){
       </div>
       <p className="eyebrow login-eyebrow">STAFF ACCESS</p>
       <h1>دخول الموظفين</h1>
-      <p className="login-copy">سجّل الدخول بحساب Discord المرتبط بالورشة، وسيتم فتح اللوحة المناسبة تلقائيًا حسب رتبتك.</p>
+      <p className="login-copy">سجّل الدخول بحساب Discord المرتبط بالورشة مرة واحدة، وسيبقى تسجيل الدخول محفوظًا على هذا الجهاز حتى تسجل الخروج أو تنتهي الجلسة.</p>
 
       <a className="discord-login-btn" href="/auth/discord">
         <span className="discord-mark">D</span>
@@ -26,7 +33,7 @@ export default function Login(){
       <div className="login-features">
         <div><span>01</span><p>دخول آمن</p></div>
         <div><span>02</span><p>تعرف تلقائي على الرتبة</p></div>
-        <div><span>03</span><p>لوحة حسب الصلاحية</p></div>
+        <div><span>03</span><p>جلسة محفوظة</p></div>
       </div>
 
       <p className="login-note">هذه البوابة مخصصة لموظفي Legendary والإدارة فقط.</p>

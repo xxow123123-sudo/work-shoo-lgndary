@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server';
-import { createOauthState } from '../../../lib/auth';
+import { newOauthState, setOauthStateCookie } from '../../../lib/auth';
 
 export async function GET(req:Request){
   const url=new URL(req.url);
   const clientId=process.env.DISCORD_CLIENT_ID;
   if(!clientId) return NextResponse.redirect(`${url.origin}/login?error=missing_client_id`);
-  const state=await createOauthState();
+  const state=newOauthState();
   const site=(process.env.NEXT_PUBLIC_SITE_URL||url.origin).replace(/\/$/,'');
   const redirectUri=`${site}/auth/callback`;
   const target=new URL('https://discord.com/oauth2/authorize');
@@ -14,5 +14,7 @@ export async function GET(req:Request){
   target.searchParams.set('redirect_uri',redirectUri);
   target.searchParams.set('scope','identify');
   target.searchParams.set('state',state);
-  return NextResponse.redirect(target);
+  const response=NextResponse.redirect(target);
+  setOauthStateCookie(response,state);
+  return response;
 }
