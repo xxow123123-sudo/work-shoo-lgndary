@@ -37,6 +37,10 @@ const commands = [
   new SlashCommandBuilder().setName('setup-panels').setDescription('إنشاء لوحات الموظفين والمتقدمين وHR والإدارة').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('set-online-panel').setDescription('تحديد روم لوحة المسجلين دخول والإجازات').addChannelOption((o:any)=>o.setName('channel').setDescription('اختر الروم').addChannelTypes(ChannelType.GuildText).setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('set-admin-log').setDescription('تحديد روم اللوق الإداري الشامل').addChannelOption((o:any)=>o.setName('channel').setDescription('اختر روم اللوق').addChannelTypes(ChannelType.GuildText).setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('set-application-channels').setDescription('ربط رومات تقديم الموقع ومراجعة المتقدمين')
+    .addChannelOption((o:any)=>o.setName('website').setDescription('روم طلبات الموقع').addChannelTypes(ChannelType.GuildText).setRequired(true))
+    .addChannelOption((o:any)=>o.setName('review').setDescription('روم مراجعة التقديم بعد استكمال البيانات').addChannelTypes(ChannelType.GuildText).setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(x => x.toJSON());
 
 const settingEnvFallback: Record<string,string> = {
@@ -79,7 +83,7 @@ const auditLabels:Record<string,string>={
   application_preaccepted:'قبول مبدئي لمتقدم',application_preaccept:'قبول مبدئي لمتقدم',application_profile_submit:'استكمال بيانات متقدم',application_interview_closed:'إغلاق مقابلة بدون قرار',application_initial_reject:'رفض مبدئي لمتقدم',application_final_accept:'قبول نهائي لمتقدم',application_final_reject:'رفض نهائي لمتقدم',application_interview:'فتح مقابلة',
   application_rejection_lifted:'رفع رفض متقدم',weekly_resources_received:'تسليم موارد',weekly_mod_requirement:'تغيير شرط التعديلات',close_week:'إغلاق الأسبوع',
   recruitment_open:'فتح التقديم',recruitment_close:'إغلاق التقديم',hr_staff_ticket_created:'إنشاء تكت مع موظف',hr_staff_ticket_closed:'إغلاق تكت موظف',
-  admin_dm_sent:'إرسال رسالة خاصة',admin_dm_failed:'فشل رسالة خاصة',setup_logs:'إعداد اللوقات',setup_panels:'إعداد اللوحات',set_online_panel:'تحديد لوحة المتصلين',set_admin_log:'تحديد اللوق الإداري'
+  admin_dm_sent:'إرسال رسالة خاصة',admin_dm_failed:'فشل رسالة خاصة',setup_logs:'إعداد اللوقات',setup_panels:'إعداد اللوحات',set_online_panel:'تحديد لوحة المتصلين',set_admin_log:'تحديد اللوق الإداري',set_application_channels:'ربط رومات التقديم'
 };
 async function adminLog(title:string, description:string){
   const log=await getTextChannel('admin_logs_channel_id');
@@ -300,6 +304,35 @@ function applicantOverwrites(guild:any){
   if(process.env.DISCORD_BOSS_ROLE_ID) arr.push({id:process.env.DISCORD_BOSS_ROLE_ID,allow:staff});
   if(process.env.DISCORD_HR_ROLE_ID) arr.push({id:process.env.DISCORD_HR_ROLE_ID,allow:staff});
   return arr;
+}
+
+async function sendApplicationToWebsiteReview(app:any, channel:any){
+  const payload={
+    content:`${process.env.DISCORD_HR_ROLE_ID?`<@&${process.env.DISCORD_HR_ROLE_ID}> `:''}طلب تقديم جديد`,
+    embeds:[new EmbedBuilder().setTitle('طلب تقديم جديد').addFields(
+      {name:'الاسم',value:app.applicant_name||'-',inline:true},
+      {name:'العمر',value:String(app.age||'-'),inline:true},
+      {name:'Discord ID',value:String(app.discord_user_id||'-'),inline:false},
+      {name:'التواجد اليومي',value:String(app.availability||'-').slice(0,1000),inline:true},
+    ).setTimestamp()],
+    components:[{type:1,components:[
+      {type:2,style:3,label:'قبول مبدئي',custom_id:`app_preaccept:${app.id}`},
+      {type:2,style:4,label:'رفض',custom_id:`app_reject_initial:${app.id}`},
+    ]}],
+  };
+  const msg=await channel.send(payload);
+  await db.from('applications').update({discord_message_id:msg.id,updated_at:new Date().toISOString()}).eq('id',app.id);
+  return msg;
+}
+
+async function syncPendingWebsiteApplications(channel:any){
+  const {data:rows,error}=await db.from('applications').select('*').eq('status','pending').is('discord_message_id',null).order('created_at',{ascending:true});
+  if(error) throw error;
+  let sent=0;
+  for(const app of rows||[]){
+    try{ await sendApplicationToWebsiteReview(app,channel); sent++; }catch(e){ console.error('Failed to sync application',app.id,e); }
+  }
+  return sent;
 }
 
 async function setupLogs(interaction:any){
@@ -642,6 +675,20 @@ client.on(Events.InteractionCreate, async interaction=>{
       const channel:any=interaction.options.getChannel('channel',true); await setSetting('admin_logs_channel_id',channel.id,interaction.user.id);
       await audit(interaction.user.id,'set_admin_log','channel',channel.id,{channel_id:channel.id});
       return interaction.reply({content:`تم ربط اللوق الإداري الشامل في <#${channel.id}>.`,ephemeral:true});
+    }
+    if(interaction.isChatInputCommand() && interaction.commandName==='set-application-channels'){
+      if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'هذا الأمر للـ Owner أو Boss فقط.',ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const website:any=interaction.options.getChannel('website',true);
+      const review:any=interaction.options.getChannel('review',true);
+      await setSetting('application_review_channel_id',website.id,interaction.user.id);
+      await setSetting('hr_records_channel_id',review.id,interaction.user.id);
+      const synced=await syncPendingWebsiteApplications(website);
+      await audit(interaction.user.id,'set_application_channels','guild',interaction.guildId||'',{website_channel_id:website.id,review_channel_id:review.id,synced_pending: synced});
+      return interaction.editReply(`تم ربط رومات التقديم:
+طلبات الموقع: <#${website.id}>
+مراجعة التقديم: <#${review.id}>
+وتمت مزامنة **${synced}** طلب قديم لم يصل للديسكورد.`);
     }
 
     if(!interaction.isButton() && !interaction.isModalSubmit() && !interaction.isUserSelectMenu()) return;

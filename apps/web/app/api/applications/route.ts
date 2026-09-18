@@ -7,6 +7,36 @@ function attachApplicationCookie(response:NextResponse, applicationId:string){
   return response;
 }
 
+async function applicationReviewChannel(db:any){
+  const {data}=await db.from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key','application_review_channel_id').maybeSingle();
+  return data?.value||process.env.DISCORD_APPLICATION_REVIEW_CHANNEL_ID;
+}
+
+async function sendApplicationToDiscord(db:any, app:any){
+  const channel=await applicationReviewChannel(db);
+  if(!channel) throw new Error('لم يتم ربط روم طلبات الموقع. شغّل /set-application-channels في Discord.');
+  const token=process.env.DISCORD_BOT_TOKEN;
+  if(!token) throw new Error('DISCORD_BOT_TOKEN غير موجود في Variables الخاصة بخدمة الموقع.');
+  const payload={
+    content:`${process.env.DISCORD_HR_ROLE_ID?`<@&${process.env.DISCORD_HR_ROLE_ID}> `:''}طلب تقديم جديد`,
+    embeds:[{title:'طلب تقديم جديد',fields:[
+      {name:'الاسم',value:app.applicant_name||'-',inline:true},
+      {name:'العمر',value:String(app.age||'-'),inline:true},
+      {name:'Discord ID',value:String(app.discord_user_id||'-'),inline:false},
+      {name:'التواجد اليومي',value:String(app.availability||'-').slice(0,1000),inline:true},
+    ]}],
+    components:[{type:1,components:[
+      {type:2,style:3,label:'قبول مبدئي',custom_id:`app_preaccept:${app.id}`},
+      {type:2,style:4,label:'رفض',custom_id:`app_reject_initial:${app.id}`},
+    ]}],
+  };
+  const dr=await fetch(`https://discord.com/api/v10/channels/${channel}/messages`,{method:'POST',headers:{authorization:`Bot ${token}`,'content-type':'application/json'},body:JSON.stringify(payload)});
+  if(!dr.ok){ const text=await dr.text(); throw new Error(`Discord API: ${text}`); }
+  const m=await dr.json();
+  await db.from('applications').update({discord_message_id:m.id,updated_at:new Date().toISOString()}).eq('id',app.id);
+  return m.id;
+}
+
 export async function POST(req:Request){
   try{
     const body=await req.json();
@@ -24,8 +54,10 @@ export async function POST(req:Request){
     if(!Number.isFinite(age)||age<1||age>99) return NextResponse.json({error:'العمر غير صحيح.'},{status:400});
     if(!Number.isFinite(dailyHours)||dailyHours<1||dailyHours>24) return NextResponse.json({error:'عدد ساعات التواجد يجب أن يكون بين 1 و24.'},{status:400});
 
-    const {data:latest}=await db.from('applications').select('id,status').eq('discord_user_id',discordId).order('created_at',{ascending:false}).limit(1).maybeSingle();
+    const {data:latest}=await db.from('applications').select('*').eq('discord_user_id',discordId).order('created_at',{ascending:false}).limit(1).maybeSingle();
     if(latest){
+      // إذا انحفظ الطلب سابقًا لكن إرسال Discord فشل، أعد المحاولة بدل تركه عالقًا.
+      if(latest.status==='pending' && !latest.discord_message_id) await sendApplicationToDiscord(db,latest);
       return attachApplicationCookie(NextResponse.json({ok:true,existing:true,status:latest.status,has_application:true}),latest.id);
     }
 
@@ -41,28 +73,7 @@ export async function POST(req:Request){
     }).select('*').single();
     if(error) throw error;
 
-    const {data:reviewSetting}=await db.from('bot_settings').select('value').eq('guild_id',process.env.DISCORD_GUILD_ID!).eq('key','application_review_channel_id').maybeSingle();
-    const channel=reviewSetting?.value||process.env.DISCORD_APPLICATION_REVIEW_CHANNEL_ID;
-    if(!channel) throw new Error('لم يتم إعداد روم طلبات الموقع. استخدم /setup-logs في Discord.');
-
-    const token=process.env.DISCORD_BOT_TOKEN!;
-    const payload={
-      content:`<@&${process.env.DISCORD_HR_ROLE_ID}> طلب تقديم جديد`,
-      embeds:[{title:'📨 طلب تقديم جديد',fields:[
-        {name:'الاسم',value:data.applicant_name||'-',inline:true},
-        {name:'العمر',value:String(data.age||'-'),inline:true},
-        {name:'Discord ID',value:`${data.discord_user_id}`,inline:false},
-        {name:'التواجد اليومي',value:String(data.availability||'-').slice(0,1000),inline:true},
-      ]}],
-      components:[{type:1,components:[
-        {type:2,style:3,label:'قبول مبدئي',custom_id:`app_preaccept:${data.id}`},
-        {type:2,style:4,label:'رفض',custom_id:`app_reject_initial:${data.id}`},
-      ]}],
-    };
-    const dr=await fetch(`https://discord.com/api/v10/channels/${channel}/messages`,{method:'POST',headers:{authorization:`Bot ${token}`,'content-type':'application/json'},body:JSON.stringify(payload)});
-    if(!dr.ok){ const text=await dr.text(); throw new Error(`Discord API: ${text}`); }
-    const m=await dr.json();
-    await db.from('applications').update({discord_message_id:m.id}).eq('id',data.id);
+    await sendApplicationToDiscord(db,data);
     await auditEvent(discordId,'application_submitted','application',data.id,{applicant_name:applicantName,age,daily_hours:dailyHours},'الموقع');
     return attachApplicationCookie(NextResponse.json({ok:true,has_application:true}),data.id);
   }catch(e:any){
