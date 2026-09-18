@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { adminDb } from './database.js';
+import { adminDb, sql } from './database.js';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -35,6 +35,8 @@ const commands = [
   new SlashCommandBuilder().setName('panel').setDescription('إرسال لوحة الموظفين').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('setup-logs').setDescription('إنشاء وربط جميع رومات سجلات الورشة').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('setup-panels').setDescription('إنشاء لوحات الموظفين والمتقدمين وHR والإدارة').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('set-online-panel').setDescription('تحديد روم لوحة المسجلين دخول والإجازات').addChannelOption((o:any)=>o.setName('channel').setDescription('اختر الروم').addChannelTypes(ChannelType.GuildText).setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('set-admin-log').setDescription('تحديد روم اللوق الإداري الشامل').addChannelOption((o:any)=>o.setName('channel').setDescription('اختر روم اللوق').addChannelTypes(ChannelType.GuildText).setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(x => x.toJSON());
 
 const settingEnvFallback: Record<string,string> = {
@@ -69,13 +71,26 @@ async function getTextChannel(key:string){
   const ch = await client.channels.fetch(id).catch(()=>null);
   return ch?.isTextBased() ? ch as any : null;
 }
-async function audit(actor:string|null, action:string, targetType?:string, targetId?:string, metadata:any={}){
-  await db.from('audit_logs').insert({ actor_discord_id: actor, action, target_type: targetType || null, target_id: targetId || null, metadata });
-}
+const auditLabels:Record<string,string>={
+  clock_in:'تسجيل دخول',clock_out:'تسجيل خروج',forced_clock_out:'خروج إجباري',tool_sale:'بيع عِدّة',vehicle_mod:'تعديل مركبة',
+  leave_requested:'طلب إجازة',leave_approved:'قبول إجازة',leave_rejected:'رفض إجازة',leave_broken:'كسر إجازة',leave_auto_return:'انتهاء إجازة تلقائي',
+  resignation_requested:'طلب استقالة',resignation_approved:'اعتماد استقالة',resignation_rejected:'رفض استقالة',employee_warning:'إنذار موظف',
+  employee_profile_edit:'تعديل بيانات موظف',employee_manual_hire:'توظيف مباشر',employee_terminated:'فصل موظف',employee_reactivated:'إعادة تفعيل موظف',
+  application_preaccepted:'قبول مبدئي لمتقدم',application_preaccept:'قبول مبدئي لمتقدم',application_profile_submit:'استكمال بيانات متقدم',application_interview_closed:'إغلاق مقابلة بدون قرار',application_initial_reject:'رفض مبدئي لمتقدم',application_final_accept:'قبول نهائي لمتقدم',application_final_reject:'رفض نهائي لمتقدم',application_interview:'فتح مقابلة',
+  application_rejection_lifted:'رفع رفض متقدم',weekly_resources_received:'تسليم موارد',weekly_mod_requirement:'تغيير شرط التعديلات',close_week:'إغلاق الأسبوع',
+  recruitment_open:'فتح التقديم',recruitment_close:'إغلاق التقديم',hr_staff_ticket_created:'إنشاء تكت مع موظف',hr_staff_ticket_closed:'إغلاق تكت موظف',
+  admin_dm_sent:'إرسال رسالة خاصة',admin_dm_failed:'فشل رسالة خاصة',setup_logs:'إعداد اللوقات',setup_panels:'إعداد اللوحات',set_online_panel:'تحديد لوحة المتصلين',set_admin_log:'تحديد اللوق الإداري'
+};
 async function adminLog(title:string, description:string){
   const log=await getTextChannel('admin_logs_channel_id');
   if(!log) return;
   await log.send({embeds:[new EmbedBuilder().setTitle(title).setDescription(description.slice(0,4000)).setTimestamp()]});
+}
+async function audit(actor:string|null, action:string, targetType?:string, targetId?:string, metadata:any={}){
+  const full={...metadata,source:metadata?.source||'Discord'};
+  await db.from('audit_logs').insert({ actor_discord_id: actor, action, target_type: targetType || null, target_id: targetId || null, metadata: full });
+  const who=actor?mention(actor):'SYSTEM'; const details=Object.keys(metadata||{}).length?short(metadata,2200):'—';
+  await adminLog(auditLabels[action]||action.replaceAll('_',' '),`المنفذ: ${who}\nالمصدر: **${full.source}**\nالهدف: ${targetType||'—'} ${targetId||''}\nالتفاصيل: ${details}`);
 }
 function scheduleDelete(channel:any, delayMs=5000){
   if(!channel?.delete) return;
@@ -96,6 +111,12 @@ function short(s:any,n=1000){ const x=String(s??'-'); return x.length>n ? x.slic
 async function currentCycle(){
   const {data}=await db.from('weekly_cycles').select('*').eq('is_current',true).limit(1).maybeSingle();
   return data;
+}
+function fmtDuration(seconds:number){const n=Math.max(0,Math.floor(Number(seconds||0)));return `${Math.floor(n/3600)} ساعة و${Math.floor((n%3600)/60)} دقيقة`;}
+async function weeklyWorkedSeconds(employeeId:string){
+  const cycle=await currentCycle(); if(!cycle) return 0;
+  const r=await sql(`select coalesce(sum(extract(epoch from (coalesce(clock_out, now()) - greatest(clock_in, $2::timestamptz)))),0)::bigint as seconds from attendance where employee_id=$1 and coalesce(clock_out, now()) >= $2::timestamptz`,[employeeId,cycle.starts_at]);
+  return Number(r.rows[0]?.seconds||0);
 }
 async function weeklyModRequirement(){
   const raw=await getSetting('weekly_vehicle_mod_requirement');
@@ -381,11 +402,11 @@ async function refreshControlPanels(preloaded?:Record<string,any>){
 }
 
 async function refreshEmployeeStatusPanel(){
-  const channel=await getTextChannel('employee_panel_channel_id'); if(!channel) return;
+  const channel=await getTextChannel('online_panel_channel_id'); if(!channel) return;
   const {data:open}=await db.from('attendance').select('id,clock_in,employees(discord_user_id,discord_username,game_name)').is('clock_out',null).order('clock_in',{ascending:true});
   const today=new Date().toISOString().slice(0,10);
   const {data:leaves}=await db.from('leave_requests').select('id,ends_on,employees(discord_user_id,discord_username,game_name)').eq('status','approved').lte('starts_on',today).gte('ends_on',today).order('ends_on',{ascending:true});
-  const active=(open??[]).slice(0,25).map((x:any)=>`${mention(x.employees?.discord_user_id)} — منذ <t:${Math.floor(new Date(x.clock_in).getTime()/1000)}:R>`).join('\n')||'لا يوجد';
+  const active=(open??[]).slice(0,25).map((x:any)=>{const seconds=Math.max(0,Math.floor((Date.now()-new Date(x.clock_in).getTime())/1000));return `${mention(x.employees?.discord_user_id)} — **${fmtDuration(seconds)}** — منذ <t:${Math.floor(new Date(x.clock_in).getTime()/1000)}:R>`}).join('\n')||'لا يوجد';
   const onLeave=(leaves??[]).slice(0,25).map((x:any)=>`${mention(x.employees?.discord_user_id)} — تنتهي **${x.ends_on}**`).join('\n')||'لا يوجد';
   const embed=new EmbedBuilder().setTitle('حالة الموظفين').addFields(
     {name:`داخل الدوام (${open?.length||0})`,value:active,inline:false},
@@ -477,7 +498,6 @@ async function createStaffTicket(interaction:any, discordId:string, reason:strin
   );
   await ticket.send({content:`${mention(discordId)} ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('تكت موظف').setDescription(`تم فتح هذا التكت بواسطة ${mention(interaction.user.id)} للتواصل مع ${mention(discordId)}.\n\n**السبب:** ${short(reason||'بدون سبب',1500)}`).setTimestamp()],components:[row]});
   await audit(interaction.user.id,'hr_staff_ticket_created','employee',emp.id,{discord_user_id:discordId,channel_id:ticket.id,reason});
-  await adminLog('إنشاء تكت مع موظف',`الموظف: ${mention(discordId)}\nأنشأه: ${mention(interaction.user.id)}\nالروم: <#${ticket.id}>\nالسبب: ${reason||'بدون سبب'}`);
   await interaction.reply({content:`تم إنشاء التكت: <#${ticket.id}>`,ephemeral:true});
 }
 
@@ -505,7 +525,6 @@ async function finalAccept(interaction:any, app:any){
   const decisions=await getTextChannel('decisions_channel_id');
   if(decisions) await decisions.send({content:`✅ **قرار قبول نهائي**\nنرحب بـ ${mention(app.discord_user_id)} ضمن فريق الورشة. ${employeeRoleId()?`<@&${employeeRoleId()}>`:''}`});
   await audit(interaction.user.id,'application_final_accept','application',app.id,{discord_user_id:app.discord_user_id});
-  await adminLog('قبول متقدم',`المتقدم: ${mention(app.discord_user_id)}\nاعتمده: ${mention(interaction.user.id)}\nالنتيجة: قبول نهائي`);
   await interaction.reply({content:'✅ تم القبول النهائي وإعطاء رتبة الموظف. إذا كانت المقابلة مفتوحة فسيغلق التكت خلال 5 ثوانٍ.',ephemeral:true});
   if(app.interview_channel_id){ const ch=await interaction.guild?.channels.fetch(app.interview_channel_id).catch(()=>null); if(ch) scheduleDelete(ch,5000); }
   await refreshControlPanels();
@@ -514,7 +533,6 @@ async function finalReject(interaction:any, app:any){
   if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
   await db.from('applications').update({status:'rejected',interview_channel_id:null,final_reviewed_by_discord_id:interaction.user.id,reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',app.id);
   await audit(interaction.user.id,'application_final_reject','application',app.id,{discord_user_id:app.discord_user_id});
-  await adminLog('رفض متقدم',`المتقدم: ${mention(app.discord_user_id)}\nالقرار بواسطة: ${mention(interaction.user.id)}\nالنتيجة: رفض`);
   await interaction.reply({content:'❌ تم رفض المتقدم. إذا كانت المقابلة مفتوحة فسيغلق التكت خلال 5 ثوانٍ.',ephemeral:true});
   if(app.interview_channel_id){ const ch=await interaction.guild?.channels.fetch(app.interview_channel_id).catch(()=>null); if(ch) scheduleDelete(ch,5000); }
   await refreshControlPanels();
@@ -589,6 +607,7 @@ client.once(Events.ClientReady, async c=>{
   if((await getSetting('recruitment_open'))===undefined) await setSetting('recruitment_open','true','system');
   await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); await processExpiredLeaves();
   setInterval(()=>{ void processExpiredLeaves().catch(console.error); },60_000);
+  setInterval(()=>{ void refreshEmployeeStatusPanel().catch(console.error); },30_000);
 });
 
 client.on(Events.GuildMemberAdd, async member=>{
@@ -612,6 +631,18 @@ client.on(Events.InteractionCreate, async interaction=>{
     if(interaction.isChatInputCommand() && interaction.commandName==='setup-panels'){
       await interaction.deferReply({ephemeral:true}); await setupPanels(interaction); return;
     }
+    if(interaction.isChatInputCommand() && interaction.commandName==='set-online-panel'){
+      if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'هذا الأمر للـ Owner أو Boss فقط.',ephemeral:true});
+      const channel:any=interaction.options.getChannel('channel',true); await setSetting('online_panel_channel_id',channel.id,interaction.user.id);
+      await audit(interaction.user.id,'set_online_panel','channel',channel.id,{channel_id:channel.id}); await refreshEmployeeStatusPanel();
+      return interaction.reply({content:`تم ربط لوحة المسجلين دخول والإجازات في <#${channel.id}>.`,ephemeral:true});
+    }
+    if(interaction.isChatInputCommand() && interaction.commandName==='set-admin-log'){
+      if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'هذا الأمر للـ Owner أو Boss فقط.',ephemeral:true});
+      const channel:any=interaction.options.getChannel('channel',true); await setSetting('admin_logs_channel_id',channel.id,interaction.user.id);
+      await audit(interaction.user.id,'set_admin_log','channel',channel.id,{channel_id:channel.id});
+      return interaction.reply({content:`تم ربط اللوق الإداري الشامل في <#${channel.id}>.`,ephemeral:true});
+    }
 
     if(!interaction.isButton() && !interaction.isModalSubmit() && !interaction.isUserSelectMenu()) return;
 
@@ -624,14 +655,17 @@ client.on(Events.InteractionCreate, async interaction=>{
         const {data:open}=await db.from('attendance').select('id').eq('employee_id',emp.id).is('clock_out',null).maybeSingle();
         if(open) return interaction.reply({content:'أنت مسجل دخول بالفعل.',ephemeral:true});
         const {error}=await db.from('attendance').insert({employee_id:emp.id}); if(error) throw error;
-        const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`🟢 ${mention(interaction.user.id)} سجّل **دخول**.`);
-        await interaction.reply({content:'🟢 تم تسجيل دخولك.',ephemeral:true});
+        const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`${mention(interaction.user.id)} سجّل **دخول**.`);
+        await audit(interaction.user.id,'clock_in','employee',emp.id,{discord_user_id:interaction.user.id});
+        await interaction.reply({content:'تم تسجيل دخولك.',ephemeral:true});
       } else {
         const {data:open}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle();
         if(!open) return interaction.reply({content:'أنت غير مسجل دخول حاليًا.',ephemeral:true});
-        await db.from('attendance').update({clock_out:new Date().toISOString()}).eq('id',open.id);
-        const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`🔴 ${mention(interaction.user.id)} سجّل **خروج**.`);
-        await interaction.reply({content:'🔴 تم تسجيل خروجك.',ephemeral:true});
+        const outAt=new Date(); await db.from('attendance').update({clock_out:outAt.toISOString()}).eq('id',open.id);
+        const shiftSeconds=Math.max(0,Math.floor((outAt.getTime()-new Date(open.clock_in).getTime())/1000)); const weeklySeconds=await weeklyWorkedSeconds(emp.id);
+        const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`**تسجيل خروج**\nالموظف: ${mention(interaction.user.id)}\nمدة الشفت: **${fmtDuration(shiftSeconds)}**\nإجمالي ساعات الأسبوع: **${fmtDuration(weeklySeconds)}**`);
+        await audit(interaction.user.id,'clock_out','employee',emp.id,{discord_user_id:interaction.user.id,shift_seconds:shiftSeconds,weekly_seconds:weeklySeconds});
+        await interaction.reply({content:`تم تسجيل خروجك. مدة الشفت: **${fmtDuration(shiftSeconds)}**.`,ephemeral:true});
       }
       await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); return;
     }
@@ -657,9 +691,11 @@ client.on(Events.InteractionCreate, async interaction=>{
             const invoiceName=safeImageName(invoice.filename,'invoice',invoice.contentType);
             await log.send({embeds:[new EmbedBuilder().setTitle('بيع عِدّة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالقيمة: **$${amount.toLocaleString()}**\nالنقاط: **1**`).setImage(`attachment://${invoiceName}`).setTimestamp()],files:[{attachment:invoice.bytes,name:invoiceName}]});
           }
-          await interaction.followUp({content:`تم تسجيل بيع عِدّة تلقائيًا. قيمة الفاتورة: **$${amount.toLocaleString()}** — النقاط: **1**.`,ephemeral:true});
+          await audit(interaction.user.id,'tool_sale','employee',emp.id,{amount,points:1});
+          await interaction.editReply({content:`تم تسجيل بيع عِدّة تلقائيًا. قيمة الفاتورة: **$${amount.toLocaleString()}** — النقاط: **1**.`});
+          setTimeout(()=>{void interaction.deleteReply().catch(()=>{});},3500);
         }else{
-          await interaction.followUp({content:`تمت قراءة قيمة الفاتورة: **$${amount.toLocaleString()}**. أرسل الآن صورة المركبة المعدلة في هذا الروم خلال دقيقتين.`,ephemeral:true});
+          await interaction.editReply({content:`تمت قراءة قيمة الفاتورة: **$${amount.toLocaleString()}**. أرسل الآن صورة المركبة المعدلة في هذا الروم خلال دقيقتين.`});
           vehicle=await waitAttachment(ch,interaction.user.id);
           const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'vehicle_mod',points:5,invoice_amount:amount,invoice_image_url:invoice.originalUrl,vehicle_image_url:vehicle.originalUrl}); if(error) throw error;
           const log=await getTextChannel('vehicle_mods_channel_id');
@@ -668,7 +704,9 @@ client.on(Events.InteractionCreate, async interaction=>{
             const vehicleName=safeImageName(vehicle.filename,'vehicle',vehicle.contentType);
             await log.send({embeds:[new EmbedBuilder().setTitle('تعديل مركبة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالقيمة: **$${amount.toLocaleString()}**\nالنقاط: **5**`).setImage(`attachment://${vehicleName}`).setTimestamp()],files:[{attachment:invoice.bytes,name:invoiceName},{attachment:vehicle.bytes,name:vehicleName}]});
           }
-          await interaction.followUp({content:`تم تسجيل تعديل المركبة تلقائيًا. قيمة الفاتورة: **$${amount.toLocaleString()}** — النقاط: **5**.`,ephemeral:true});
+          await audit(interaction.user.id,'vehicle_mod','employee',emp.id,{amount,points:5});
+          await interaction.editReply({content:`تم تسجيل تعديل المركبة تلقائيًا. قيمة الفاتورة: **$${amount.toLocaleString()}** — النقاط: **5**.`});
+          setTimeout(()=>{void interaction.deleteReply().catch(()=>{});},3500);
         }
       }finally{
         await deleteCollected(invoice);
@@ -684,7 +722,6 @@ client.on(Events.InteractionCreate, async interaction=>{
       if(action==='leave'){
         const modal=new ModalBuilder().setCustomId('request_leave_submit').setTitle('طلب إجازة');
         modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('starts_on').setLabel('تاريخ البداية YYYY-MM-DD').setPlaceholder('2026-09-20').setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('days').setLabel('عدد الأيام').setPlaceholder('3').setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('السبب').setStyle(TextInputStyle.Paragraph).setRequired(false)),
         ); return interaction.showModal(modal);
@@ -707,19 +744,18 @@ client.on(Events.InteractionCreate, async interaction=>{
 
     if(interaction.isModalSubmit() && interaction.customId==='request_leave_submit'){
       const emp=await getEmployee(interaction.user.id); if(!emp) return interaction.reply({content:'أنت غير مسجل كموظف نشط.',ephemeral:true});
-      const starts=interaction.fields.getTextInputValue('starts_on').trim(); const days=Number(interaction.fields.getTextInputValue('days').trim()); const reason=interaction.fields.getTextInputValue('reason').trim();
-      if(!/^\d{4}-\d{2}-\d{2}$/.test(starts)||!Number.isInteger(days)||days<1||days>60) return interaction.reply({content:'تأكد من التاريخ وعدد الأيام (1 إلى 60).',ephemeral:true});
-      const startDate=new Date(starts+'T00:00:00Z'); if(Number.isNaN(startDate.getTime())) return interaction.reply({content:'تاريخ البداية غير صحيح.',ephemeral:true});
-      const endDate=new Date(startDate); endDate.setUTCDate(endDate.getUTCDate()+days-1); const ends=endDate.toISOString().slice(0,10);
-      const {data:leave,error}=await db.from('leave_requests').insert({employee_id:emp.id,starts_on:starts,ends_on:ends,reason:reason||null}).select('*').single(); if(error) throw error;
+      const days=Number(interaction.fields.getTextInputValue('days').trim()); const reason=interaction.fields.getTextInputValue('reason').trim();
+      if(!Number.isInteger(days)||days<1||days>60) return interaction.reply({content:'عدد الأيام يجب أن يكون من 1 إلى 60.',ephemeral:true});
+      const {data:leave,error}=await db.from('leave_requests').insert({employee_id:emp.id,requested_days:days,starts_on:null,ends_on:null,reason:reason||null}).select('*').single(); if(error) throw error;
       const hr=await getTextChannel('hr_records_channel_id'); if(hr){
         const buttons=new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setCustomId(`leave_accept:${leave.id}`).setLabel('قبول الإجازة').setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId(`leave_reject:${leave.id}`).setLabel('رفض').setStyle(ButtonStyle.Danger),
         );
-        await hr.send({content:`<@&${process.env.DISCORD_HR_ROLE_ID}> ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('🏖️ طلب إجازة').setDescription(`الموظف: ${mention(interaction.user.id)}\nمن: **${starts}**\nإلى: **${ends}**\nالمدة: **${days} يوم**\nالسبب: ${reason||'—'}`).setTimestamp()],components:[buttons]});
+        await hr.send({content:`<@&${process.env.DISCORD_HR_ROLE_ID}> ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('🏖️ طلب إجازة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالمدة المطلوبة: **${days} يوم**\nتبدأ الإجازة من وقت اعتماد HR\nالسبب: ${reason||'—'}`).setTimestamp()],components:[buttons]});
       }
-      await interaction.reply({content:'✅ تم إرسال طلب الإجازة إلى HR.',ephemeral:true}); return;
+      await audit(interaction.user.id,'leave_requested','leave_request',leave.id,{days,reason});
+      await interaction.reply({content:'تم إرسال طلب الإجازة إلى HR.',ephemeral:true}); return;
     }
 
     if(interaction.isModalSubmit() && interaction.customId==='request_resign_submit'){
@@ -733,28 +769,31 @@ client.on(Events.InteractionCreate, async interaction=>{
         );
         await hr.send({content:`<@&${process.env.DISCORD_HR_ROLE_ID}> ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('📄 طلب استقالة').setDescription(`الموظف: ${mention(interaction.user.id)}\nالسبب: **${reason}**`).setTimestamp()],components:[buttons]});
       }
-      await interaction.reply({content:'✅ تم إرسال طلب الاستقالة إلى الإدارة.',ephemeral:true}); return;
+      await audit(interaction.user.id,'resignation_requested','resignation_request',req.id,{reason});
+      await interaction.reply({content:'تم إرسال طلب الاستقالة إلى الإدارة.',ephemeral:true}); return;
     }
 
     if(interaction.isButton() && (interaction.customId.startsWith('leave_accept:')||interaction.customId.startsWith('leave_reject:'))){
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
       const [kind,id]=interaction.customId.split(':'); const {data:leave}=await db.from('leave_requests').select('*,employees(discord_user_id)').eq('id',id).maybeSingle(); if(!leave) return interaction.reply({content:'طلب الإجازة غير موجود.',ephemeral:true});
-      if(kind==='leave_reject'){ await db.from('leave_requests').update({status:'rejected',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id); await interaction.reply({content:'❌ تم رفض الإجازة.',ephemeral:true}); return; }
-      await db.from('leave_requests').update({status:'approved',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id);
+      if(kind==='leave_reject'){ await db.from('leave_requests').update({status:'rejected',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id); await audit(interaction.user.id,'leave_rejected','leave_request',id,{days:leave.requested_days||1}); await interaction.reply({content:'تم رفض الإجازة.',ephemeral:true}); return; }
+      const days=Math.max(1,Number(leave.requested_days||1)); const startDate=new Date(); const endDate=new Date(startDate); endDate.setUTCDate(endDate.getUTCDate()+days-1); const starts=startDate.toISOString().slice(0,10); const ends=endDate.toISOString().slice(0,10);
+      await db.from('leave_requests').update({status:'approved',starts_on:starts,ends_on:ends,reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id);
       const discordId=leave.employees?.discord_user_id; const member=discordId?await interaction.guild?.members.fetch(discordId).catch(()=>null):null; const lrole=await ensureLeaveRole(interaction.guild);
       if(member&&employeeRoleId()) await member.roles.remove(employeeRoleId()!).catch(()=>{}); if(member&&lrole) await member.roles.add(lrole.id).catch(()=>{});
       const {data:emp}=discordId?await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle():{data:null}; if(emp){ const {data:shift}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle(); if(shift) await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:'بدء إجازة'}).eq('id',shift.id); }
-      await audit(interaction.user.id,'leave_approved','leave_request',id,{discord_user_id:discordId}); await interaction.reply({content:'✅ تم قبول الإجازة وسحب رتبة الموظف وإعطاء رتبة إجازة.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
+      await audit(interaction.user.id,'leave_approved','leave_request',id,{discord_user_id:discordId,days,starts_on:starts,ends_on:ends}); await interaction.reply({content:'✅ تم قبول الإجازة وسحب رتبة الموظف وإعطاء رتبة إجازة.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
     }
 
     if(interaction.isButton() && (interaction.customId.startsWith('resign_accept:')||interaction.customId.startsWith('resign_reject:'))){
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
       const [kind,id]=interaction.customId.split(':'); const {data:req}=await db.from('resignation_requests').select('*,employees(discord_user_id)').eq('id',id).maybeSingle(); if(!req) return interaction.reply({content:'طلب الاستقالة غير موجود.',ephemeral:true});
-      if(kind==='resign_reject'){ await db.from('resignation_requests').update({status:'rejected',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id); return interaction.reply({content:'تم رفض الاستقالة.',ephemeral:true}); }
+      if(kind==='resign_reject'){ await db.from('resignation_requests').update({status:'rejected',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id); await audit(interaction.user.id,'resignation_rejected','resignation_request',id,{}); return interaction.reply({content:'تم رفض الاستقالة.',ephemeral:true}); }
       const discordId=req.employees?.discord_user_id; await db.from('resignation_requests').update({status:'approved',reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',id);
       if(discordId){ const {data:emp}=await db.from('employees').select('*').eq('discord_user_id',discordId).maybeSingle(); if(emp) await db.from('employees').update({is_active:false,employment_status:'terminated',status_reason:'استقالة معتمدة',status_changed_by_discord_id:interaction.user.id,status_changed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',emp.id); const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(member&&employeeRoleId()) await member.roles.remove(employeeRoleId()!).catch(()=>{}); const lr=await leaveRoleId(); if(member&&lr) await member.roles.remove(lr).catch(()=>{}); }
       const decisions=await getTextChannel('decisions_channel_id'); if(decisions&&discordId) await decisions.send(`📄 **اعتماد استقالة**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}`);
-      await interaction.reply({content:'✅ تم اعتماد الاستقالة وإيقاف الحساب الوظيفي.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
+      await audit(interaction.user.id,'resignation_approved','resignation_request',id,{discord_user_id:discordId});
+      await interaction.reply({content:'تم اعتماد الاستقالة وإيقاف الحساب الوظيفي.',ephemeral:true}); await refreshEmployeeStatusPanel(); return;
     }
 
     // Applicant completion button
@@ -838,7 +877,6 @@ client.on(Events.InteractionCreate, async interaction=>{
         if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
         await db.from('applications').update({status:'profile_submitted',interview_channel_id:null,updated_at:new Date().toISOString()}).eq('id',app.id);
         await audit(interaction.user.id,'application_interview_closed','application',app.id,{discord_user_id:app.discord_user_id,channel_id:interaction.channelId});
-        await adminLog('إغلاق مقابلة بدون قرار',`المتقدم: ${mention(app.discord_user_id)}\nأغلقها: ${mention(interaction.user.id)}\nالحالة: عاد الطلب إلى انتظار قرار HR`);
         await interaction.reply({content:'تم إغلاق المقابلة بدون قبول أو رفض. سيحذف التكت خلال 5 ثوانٍ.'});
         scheduleDelete(interaction.channel,5000); await refreshControlPanels(); return;
       }
@@ -849,7 +887,6 @@ client.on(Events.InteractionCreate, async interaction=>{
       if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الزر للـ HR والإدارة فقط.',ephemeral:true});
       const discordId=interaction.customId.split(':')[1]; const emp=await getEmployee(discordId,false);
       await audit(interaction.user.id,'hr_staff_ticket_closed','employee',emp?.id||discordId,{discord_user_id:discordId,channel_id:interaction.channelId});
-      await adminLog('إغلاق تكت موظف',`الموظف: ${mention(discordId)}\nأغلقه: ${mention(interaction.user.id)}\nالروم: <#${interaction.channelId}>`);
       await interaction.reply({content:'تم إغلاق التكت. سيحذف خلال 5 ثوانٍ.'});
       scheduleDelete(interaction.channel,5000); return;
     }
@@ -933,9 +970,10 @@ client.on(Events.InteractionCreate, async interaction=>{
       const discordId=interaction.customId.split(':')[1]; const reason=interaction.fields.getTextInputValue('reason').trim();
       const emp=await getEmployee(discordId,false); if(!emp) return interaction.reply({content:'الموظف غير موجود.',ephemeral:true});
       const {data:shift}=await db.from('attendance').select('*').eq('employee_id',emp.id).is('clock_out',null).maybeSingle(); if(!shift) return interaction.reply({content:'الموظف ليس داخل الدوام حاليًا.',ephemeral:true});
-      await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:reason}).eq('id',shift.id);
-      const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`🚪 **خروج إجباري**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}\nالسبب: ${reason}`);
-      await audit(interaction.user.id,'forced_clock_out','employee',emp.id,{reason});
+      const outAt=new Date(); await db.from('attendance').update({clock_out:outAt.toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:reason}).eq('id',shift.id);
+      const shiftSeconds=Math.max(0,Math.floor((outAt.getTime()-new Date(shift.clock_in).getTime())/1000)); const weeklySeconds=await weeklyWorkedSeconds(emp.id);
+      const log=await getTextChannel('attendance_channel_id'); if(log) await log.send(`**خروج إجباري**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}\nمدة الشفت: **${fmtDuration(shiftSeconds)}**\nإجمالي ساعات الأسبوع: **${fmtDuration(weeklySeconds)}**\nالسبب: ${reason}`);
+      await audit(interaction.user.id,'forced_clock_out','employee',emp.id,{discord_user_id:discordId,reason,shift_seconds:shiftSeconds,weekly_seconds:weeklySeconds});
       await interaction.reply({content:'✅ تم تسجيل الخروج الإجباري.',ephemeral:true}); await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); return;
     }
     if(interaction.isModalSubmit() && interaction.customId.startsWith('hr_warning_submit:')){
@@ -1057,11 +1095,9 @@ client.on(Events.InteractionCreate, async interaction=>{
       try{
         await member.send({embeds:[new EmbedBuilder().setTitle(title).setDescription(message).setFooter({text:'Legendary Workshop'}).setTimestamp()]});
         await audit(interaction.user.id,'admin_dm_sent','discord_member',discordId,{title,message});
-        await adminLog('رسالة خاصة من الإدارة',`إلى: ${mention(discordId)}\nأرسلها: ${mention(interaction.user.id)}\nالعنوان: **${short(title,200)}**\nالرسالة:\n${short(message,2500)}`);
         return interaction.reply({content:'تم إرسال الرسالة للعضو في الخاص وتسجيلها في اللوق الإداري.',ephemeral:true});
       }catch(e:any){
         await audit(interaction.user.id,'admin_dm_failed','discord_member',discordId,{title,message,error:String(e?.message||e)});
-        await adminLog('فشل إرسال رسالة خاصة',`إلى: ${mention(discordId)}\nحاول إرسالها: ${mention(interaction.user.id)}\nالسبب: ${short(e?.message||'الخاص مغلق أو تعذر الإرسال',1000)}\nالرسالة:\n${short(message,2000)}`);
         return interaction.reply({content:'تعذر إرسال الرسالة؛ غالبًا الخاص عند العضو مغلق. تم تسجيل المحاولة في اللوق الإداري.',ephemeral:true});
       }
     }
@@ -1075,7 +1111,6 @@ client.on(Events.InteractionCreate, async interaction=>{
       if(shift) await db.from('attendance').update({clock_out:new Date().toISOString(),forced_out:true,forced_out_by_discord_id:interaction.user.id,forced_out_reason:'فصل الموظف: '+reason}).eq('id',shift.id);
       const member=await interaction.guild?.members.fetch(discordId).catch(()=>null); if(member&&employeeRoleId()) await member.roles.remove(employeeRoleId()!).catch(()=>{});
       const lr=await leaveRoleId(); if(member&&lr) await member.roles.remove(lr).catch(()=>{});
-      const log=await getTextChannel('admin_logs_channel_id'); if(log) await log.send(`⛔ **فصل موظف**\nالموظف: ${mention(discordId)}\nبواسطة: ${mention(interaction.user.id)}\nالسبب: ${reason}`);
       await audit(interaction.user.id,'employee_terminated','employee',emp.id,{reason}); await interaction.reply({content:'⛔ تم فصل الموظف وقفل صلاحياته، مع إبقاء جميع إحصائياته القديمة.',ephemeral:true}); await refreshStatsPanel(); await refreshControlPanels(); await refreshEmployeeStatusPanel(); return;
     }
     if(interaction.isModalSubmit() && interaction.customId==='admin_mod_requirement_submit'){

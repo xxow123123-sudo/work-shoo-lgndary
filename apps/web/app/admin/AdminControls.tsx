@@ -6,7 +6,7 @@ export default function AdminControls({employees,recruitmentOpen,modRequirement}
   const [msg,setMsg]=useState('');
   async function action(body:any){setMsg('جاري التنفيذ...');try{await post(body);setMsg('تم تنفيذ الإجراء ✅');window.location.reload();}catch(e:any){setMsg(e.message);}}
   async function form(e:FormEvent<HTMLFormElement>,type:string){e.preventDefault();const body:any=Object.fromEntries(new FormData(e.currentTarget).entries());body.action=type;await action(body);}
-  const EmployeeSelect=()=> <select name="discord_id" required defaultValue=""><option value="" disabled>اختر الموظف</option>{employees.map(e=><option key={e.id} value={e.discord_user_id}>{e.game_name||e.discord_username||e.discord_user_id}</option>)}</select>;
+  const EmployeeSelect=()=> <select name="discord_id" required defaultValue=""><option value="" disabled>اختر الموظف</option>{employees.map(e=><option key={e.id} value={e.discord_user_id}>{e.discord_display_name||e.game_name||e.discord_username||e.discord_user_id}{e.discord_live_username?` (@${e.discord_live_username})`:''}</option>)}</select>;
   return <section className="management-actions admin-actions">
     <div className="section-title-line"><div><span>MANAGEMENT CONTROLS</span><h2>التحكم الإداري</h2></div>{msg&&<p>{msg}</p>}</div>
     <div className="admin-control-grid">

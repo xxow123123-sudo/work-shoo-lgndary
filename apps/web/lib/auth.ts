@@ -4,7 +4,7 @@ import { cookies } from 'next/headers';
 const SESSION_COOKIE='legendary_session';
 const STATE_COOKIE='legendary_oauth_state';
 
-type Session={discordId:string;username:string;avatar?:string|null;exp:number};
+type Session={discordId:string;username:string;displayName?:string;avatar?:string|null;exp:number};
 
 function secret(){
   const value=process.env.SESSION_SECRET;
@@ -45,8 +45,14 @@ export async function verifyOauthState(state:string|null){
 
 export async function setSession(user:{id:string;username:string;global_name?:string|null;avatar?:string|null}){
   const store=await cookies();
-  const session:Session={discordId:user.id,username:user.global_name||user.username,avatar:user.avatar||null,exp:Date.now()+1000*60*60*24*7};
+  const session:Session={discordId:user.id,username:user.username,displayName:user.global_name||user.username,avatar:user.avatar||null,exp:Date.now()+1000*60*60*24*7};
   store.set(SESSION_COOKIE,encode(session),{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/',maxAge:60*60*24*7});
+}
+
+export function sessionAvatarUrl(session:Session|null){
+  if(!session) return null;
+  if(session.avatar) return `https://cdn.discordapp.com/avatars/${session.discordId}/${session.avatar}.png?size=128`;
+  try{return `https://cdn.discordapp.com/embed/avatars/${Number((BigInt(session.discordId)>>22n)%6n)}.png`;}catch{return 'https://cdn.discordapp.com/embed/avatars/0.png';}
 }
 
 export async function clearSession(){const store=await cookies();store.delete(SESSION_COOKIE);}

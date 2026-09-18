@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { setSession, verifyOauthState } from '../../../lib/auth';
+import { auditEvent } from '../../../lib/audit';
 
 export async function GET(req:Request){
   const url=new URL(req.url);
@@ -22,5 +23,6 @@ export async function GET(req:Request){
   if(!userRes?.ok) return NextResponse.redirect(`${site}/login?error=oauth_user`);
   const user:any=await userRes.json();
   await setSession(user);
+  await auditEvent(user.id,'website_login','discord_user',user.id,{username:user.username,display_name:user.global_name||user.username},'الموقع');
   return NextResponse.redirect(`${site}/portal`);
 }

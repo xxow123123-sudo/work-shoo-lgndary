@@ -130,8 +130,9 @@ create table if not exists public.warnings (
 create table if not exists public.leave_requests (
   id uuid primary key default gen_random_uuid(),
   employee_id uuid not null references public.employees(id) on delete cascade,
-  starts_on date not null,
-  ends_on date not null,
+  starts_on date,
+  ends_on date,
+  requested_days integer not null default 1 check (requested_days between 1 and 60),
   reason text,
   status public.leave_status not null default 'pending',
   reviewed_by_discord_id text,
@@ -139,6 +140,9 @@ create table if not exists public.leave_requests (
   updated_at timestamptz not null default now()
 );
 
+alter table public.leave_requests alter column starts_on drop not null;
+alter table public.leave_requests alter column ends_on drop not null;
+alter table public.leave_requests add column if not exists requested_days integer not null default 1;
 alter table public.leave_requests add column if not exists ended_early_at timestamptz;
 alter table public.leave_requests add column if not exists auto_returned_at timestamptz;
 

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { adminDb } from '../../../lib/database';
+import { auditEvent } from '../../../lib/audit';
 
 function attachApplicationCookie(response:NextResponse, applicationId:string){
   response.cookies.set('legendary_app',applicationId,{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',path:'/',maxAge:60*60*24*365});
@@ -62,6 +63,7 @@ export async function POST(req:Request){
     if(!dr.ok){ const text=await dr.text(); throw new Error(`Discord API: ${text}`); }
     const m=await dr.json();
     await db.from('applications').update({discord_message_id:m.id}).eq('id',data.id);
+    await auditEvent(discordId,'application_submitted','application',data.id,{applicant_name:applicantName,age,daily_hours:dailyHours},'الموقع');
     return attachApplicationCookie(NextResponse.json({ok:true,has_application:true}),data.id);
   }catch(e:any){
     return NextResponse.json({error:e.message||'error'},{status:500});
