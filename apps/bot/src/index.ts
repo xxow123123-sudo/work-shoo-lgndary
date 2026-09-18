@@ -72,6 +72,15 @@ async function getTextChannel(key:string){
 async function audit(actor:string|null, action:string, targetType?:string, targetId?:string, metadata:any={}){
   await db.from('audit_logs').insert({ actor_discord_id: actor, action, target_type: targetType || null, target_id: targetId || null, metadata });
 }
+async function adminLog(title:string, description:string){
+  const log=await getTextChannel('admin_logs_channel_id');
+  if(!log) return;
+  await log.send({embeds:[new EmbedBuilder().setTitle(title).setDescription(description.slice(0,4000)).setTimestamp()]});
+}
+function scheduleDelete(channel:any, delayMs=5000){
+  if(!channel?.delete) return;
+  setTimeout(()=>channel.delete().catch(()=>{}),delayMs);
+}
 async function getEmployee(discordId:string, activeOnly=true){
   let q=db.from('employees').select('*').eq('discord_user_id',discordId);
   if(activeOnly) q=q.eq('is_active',true).eq('employment_status','active');
@@ -213,6 +222,7 @@ function hrRows(){ return [
   ),
   new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId('hr:lift_rejection').setLabel('رفع رفض متقدم').setEmoji('♻️').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('hr:create_staff_ticket').setLabel('إنشاء تكت مع موظف').setStyle(ButtonStyle.Primary),
   ),
 ]; }
 function adminRows(){ return [
@@ -226,6 +236,7 @@ function adminRows(){ return [
   new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId('admin:set_mod_requirement').setLabel('شرط التعديلات').setEmoji('🚗').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('admin:resource_delivery').setLabel('تسجيل تسليم موارد').setEmoji('📦').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('admin:dm_member').setLabel('إرسال رسالة خاصة').setStyle(ButtonStyle.Primary),
   ),
 ]; }
 
@@ -434,6 +445,42 @@ async function addApplicantRoleIfPresent(guild:any,discordId:string){
   if(!applicantRoleId()) return;
   const m=await guild.members.fetch(discordId).catch(()=>null); if(m) await m.roles.add(applicantRoleId()!).catch(()=>{});
 }
+async function ensureStaffTicketsCategory(guild:any){
+  const saved=await getSetting('staff_tickets_category_id');
+  if(saved){ const c=await guild.channels.fetch(saved).catch(()=>null); if(c?.type===ChannelType.GuildCategory) return c; }
+  let category=guild.channels.cache.find((c:any)=>c.type===ChannelType.GuildCategory&&c.name==='🎫・تكتات-الموظفين');
+  if(!category){
+    category=await guild.channels.create({name:'🎫・تكتات-الموظفين',type:ChannelType.GuildCategory,permissionOverwrites:staffOverwrites(guild,true)});
+  }
+  await setSetting('staff_tickets_category_id',category.id,'system');
+  return category;
+}
+async function createStaffTicket(interaction:any, discordId:string, reason:string){
+  if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
+  const guild=interaction.guild; if(!guild) throw new Error('استخدم هذا الإجراء داخل السيرفر.');
+  const emp=await getEmployee(discordId,false);
+  if(!emp) return interaction.reply({content:'هذا الـ Discord ID غير مسجل كموظف في النظام.',ephemeral:true});
+  const member=await guild.members.fetch(discordId).catch(()=>null);
+  if(!member) return interaction.reply({content:'الموظف غير موجود داخل السيرفر حاليًا.',ephemeral:true});
+  const category=await ensureStaffTicketsCategory(guild);
+  const overwrites:any[]=[
+    {id:guild.roles.everyone.id,deny:[PermissionFlagsBits.ViewChannel]},
+    {id:discordId,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.ReadMessageHistory]},
+  ];
+  if(process.env.DISCORD_HR_ROLE_ID) overwrites.push({id:process.env.DISCORD_HR_ROLE_ID,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.ReadMessageHistory]});
+  if(process.env.DISCORD_BOSS_ROLE_ID) overwrites.push({id:process.env.DISCORD_BOSS_ROLE_ID,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.ReadMessageHistory]});
+  if(process.env.DISCORD_OWNER_USER_ID) overwrites.push({id:process.env.DISCORD_OWNER_USER_ID,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.ReadMessageHistory]});
+  const safe=(emp.game_name||member.user.username||'employee').toLowerCase().replace(/[^a-z0-9؀-ۿ]+/gi,'-').replace(/^-+|-+$/g,'').slice(0,35)||'employee';
+  const ticket=await guild.channels.create({name:`staff-${safe}-${String(discordId).slice(-4)}`.slice(0,95),type:ChannelType.GuildText,parent:category.id,permissionOverwrites:overwrites});
+  const row=new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`staff_ticket_close:${discordId}`).setLabel('إغلاق التكت').setStyle(ButtonStyle.Danger),
+  );
+  await ticket.send({content:`${mention(discordId)} ${mention(interaction.user.id)}`,embeds:[new EmbedBuilder().setTitle('تكت موظف').setDescription(`تم فتح هذا التكت بواسطة ${mention(interaction.user.id)} للتواصل مع ${mention(discordId)}.\n\n**السبب:** ${short(reason||'بدون سبب',1500)}`).setTimestamp()],components:[row]});
+  await audit(interaction.user.id,'hr_staff_ticket_created','employee',emp.id,{discord_user_id:discordId,channel_id:ticket.id,reason});
+  await adminLog('إنشاء تكت مع موظف',`الموظف: ${mention(discordId)}\nأنشأه: ${mention(interaction.user.id)}\nالروم: <#${ticket.id}>\nالسبب: ${reason||'بدون سبب'}`);
+  await interaction.reply({content:`تم إنشاء التكت: <#${ticket.id}>`,ephemeral:true});
+}
+
 async function finalAccept(interaction:any, app:any){
   if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
   const member=await interaction.guild?.members.fetch(app.discord_user_id).catch(()=>null);
@@ -454,18 +501,22 @@ async function finalAccept(interaction:any, app:any){
     status_changed_at:new Date().toISOString(),
     updated_at:new Date().toISOString(),
   },{onConflict:'discord_user_id'});
-  await db.from('applications').update({status:'accepted',final_reviewed_by_discord_id:interaction.user.id,reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',app.id);
+  await db.from('applications').update({status:'accepted',interview_channel_id:null,final_reviewed_by_discord_id:interaction.user.id,reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',app.id);
   const decisions=await getTextChannel('decisions_channel_id');
   if(decisions) await decisions.send({content:`✅ **قرار قبول نهائي**\nنرحب بـ ${mention(app.discord_user_id)} ضمن فريق الورشة. ${employeeRoleId()?`<@&${employeeRoleId()}>`:''}`});
   await audit(interaction.user.id,'application_final_accept','application',app.id,{discord_user_id:app.discord_user_id});
-  await interaction.reply({content:'✅ تم القبول النهائي وإعطاء رتبة الموظف.',ephemeral:true});
+  await adminLog('قبول متقدم',`المتقدم: ${mention(app.discord_user_id)}\nاعتمده: ${mention(interaction.user.id)}\nالنتيجة: قبول نهائي`);
+  await interaction.reply({content:'✅ تم القبول النهائي وإعطاء رتبة الموظف. إذا كانت المقابلة مفتوحة فسيغلق التكت خلال 5 ثوانٍ.',ephemeral:true});
+  if(app.interview_channel_id){ const ch=await interaction.guild?.channels.fetch(app.interview_channel_id).catch(()=>null); if(ch) scheduleDelete(ch,5000); }
   await refreshControlPanels();
 }
 async function finalReject(interaction:any, app:any){
   if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
-  await db.from('applications').update({status:'rejected',final_reviewed_by_discord_id:interaction.user.id,reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',app.id);
+  await db.from('applications').update({status:'rejected',interview_channel_id:null,final_reviewed_by_discord_id:interaction.user.id,reviewed_by_discord_id:interaction.user.id,updated_at:new Date().toISOString()}).eq('id',app.id);
   await audit(interaction.user.id,'application_final_reject','application',app.id,{discord_user_id:app.discord_user_id});
-  await interaction.reply({content:'❌ تم رفض المتقدم. سيظهر له "أنت مرفوض" إذا ضغط زر الاستكمال حتى يتم رفع الرفض.',ephemeral:true});
+  await adminLog('رفض متقدم',`المتقدم: ${mention(app.discord_user_id)}\nالقرار بواسطة: ${mention(interaction.user.id)}\nالنتيجة: رفض`);
+  await interaction.reply({content:'❌ تم رفض المتقدم. إذا كانت المقابلة مفتوحة فسيغلق التكت خلال 5 ثوانٍ.',ephemeral:true});
+  if(app.interview_channel_id){ const ch=await interaction.guild?.channels.fetch(app.interview_channel_id).catch(()=>null); if(ch) scheduleDelete(ch,5000); }
   await refreshControlPanels();
 }
 async function openInterview(interaction:any, app:any){
@@ -485,6 +536,7 @@ async function openInterview(interaction:any, app:any){
   const row=new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`app_final_accept:${app.id}`).setLabel('قبول').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`app_final_reject:${app.id}`).setLabel('رفض').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`app_interview_close:${app.id}`).setLabel('إغلاق المقابلة').setStyle(ButtonStyle.Secondary),
   );
   await ticket.send({content:`${mention(app.discord_user_id)} <@&${process.env.DISCORD_HR_ROLE_ID}>`,embeds:[new EmbedBuilder().setTitle('🎙️ مقابلة متقدم').addFields(
     {name:'الاسم داخل اللعبة',value:short(app.profile_game_name),inline:true},
@@ -777,12 +829,29 @@ client.on(Events.InteractionCreate, async interaction=>{
     }
 
     // Final HR buttons
-    if(interaction.isButton() && (interaction.customId.startsWith('app_final_accept:') || interaction.customId.startsWith('app_final_reject:') || interaction.customId.startsWith('app_final_interview:'))){
+    if(interaction.isButton() && (interaction.customId.startsWith('app_final_accept:') || interaction.customId.startsWith('app_final_reject:') || interaction.customId.startsWith('app_final_interview:') || interaction.customId.startsWith('app_interview_close:'))){
       const [action,id]=interaction.customId.split(':');
       const {data:app}=await db.from('applications').select('*').eq('id',id).maybeSingle(); if(!app) return interaction.reply({content:'الطلب غير موجود.',ephemeral:true});
       if(action==='app_final_accept') return void await finalAccept(interaction,app);
       if(action==='app_final_reject') return void await finalReject(interaction,app);
+      if(action==='app_interview_close'){
+        if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الإجراء للـ HR والإدارة فقط.',ephemeral:true});
+        await db.from('applications').update({status:'profile_submitted',interview_channel_id:null,updated_at:new Date().toISOString()}).eq('id',app.id);
+        await audit(interaction.user.id,'application_interview_closed','application',app.id,{discord_user_id:app.discord_user_id,channel_id:interaction.channelId});
+        await adminLog('إغلاق مقابلة بدون قرار',`المتقدم: ${mention(app.discord_user_id)}\nأغلقها: ${mention(interaction.user.id)}\nالحالة: عاد الطلب إلى انتظار قرار HR`);
+        await interaction.reply({content:'تم إغلاق المقابلة بدون قبول أو رفض. سيحذف التكت خلال 5 ثوانٍ.'});
+        scheduleDelete(interaction.channel,5000); await refreshControlPanels(); return;
+      }
       return void await openInterview(interaction,app);
+    }
+
+    if(interaction.isButton() && interaction.customId.startsWith('staff_ticket_close:')){
+      if(!isHrOrHigher(interaction)) return interaction.reply({content:'هذا الزر للـ HR والإدارة فقط.',ephemeral:true});
+      const discordId=interaction.customId.split(':')[1]; const emp=await getEmployee(discordId,false);
+      await audit(interaction.user.id,'hr_staff_ticket_closed','employee',emp?.id||discordId,{discord_user_id:discordId,channel_id:interaction.channelId});
+      await adminLog('إغلاق تكت موظف',`الموظف: ${mention(discordId)}\nأغلقه: ${mention(interaction.user.id)}\nالروم: <#${interaction.channelId}>`);
+      await interaction.reply({content:'تم إغلاق التكت. سيحذف خلال 5 ثوانٍ.'});
+      scheduleDelete(interaction.channel,5000); return;
     }
 
     // HR panel actions
@@ -817,6 +886,14 @@ client.on(Events.InteractionCreate, async interaction=>{
         modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للمتقدم').setStyle(TextInputStyle.Short).setRequired(true)));
         return interaction.showModal(modal);
       }
+      if(action==='create_staff_ticket'){
+        const modal=new ModalBuilder().setCustomId('hr_create_staff_ticket_submit').setTitle('إنشاء تكت مع موظف');
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('discord_id').setLabel('Discord ID للموظف').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('سبب فتح التكت (اختياري)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)),
+        );
+        return interaction.showModal(modal);
+      }
     }
 
     if(interaction.isUserSelectMenu() && interaction.customId.startsWith('hr_select:')){
@@ -841,6 +918,14 @@ client.on(Events.InteractionCreate, async interaction=>{
           new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('citizen_id').setLabel('Citizen ID الجديد (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
         ); return interaction.showModal(modal);
       }
+    }
+
+    if(interaction.isModalSubmit() && interaction.customId==='hr_create_staff_ticket_submit'){
+      if(!isHrOrHigher(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
+      const discordId=interaction.fields.getTextInputValue('discord_id').trim();
+      const reason=interaction.fields.getTextInputValue('reason').trim();
+      if(!/^\d{15,25}$/.test(discordId)) return interaction.reply({content:'Discord ID غير صحيح.',ephemeral:true});
+      return void await createStaffTicket(interaction,discordId,reason);
     }
 
     if(interaction.isModalSubmit() && interaction.customId.startsWith('hr_forceout_submit:')){
@@ -917,6 +1002,9 @@ client.on(Events.InteractionCreate, async interaction=>{
       if(action==='resource_delivery'){
         return interaction.reply({content:'اختر الموظف الذي سلّم الموارد:',components:[userPicker('admin_select:resource')],ephemeral:true});
       }
+      if(action==='dm_member'){
+        return interaction.reply({content:'اختر العضو الذي تريد إرسال رسالة خاصة له:',components:[userPicker('admin_select:dm','اختر العضو')],ephemeral:true});
+      }
       if(action==='close_week'){
         const row=new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setCustomId('admin:close_week_confirm').setLabel('تأكيد إغلاق الأسبوع').setStyle(ButtonStyle.Danger),
@@ -948,6 +1036,33 @@ client.on(Events.InteractionCreate, async interaction=>{
         const modal=new ModalBuilder().setCustomId(`admin_resource_submit:${discordId}`).setTitle('تسجيل تسليم موارد');
         modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('quantity').setLabel('الكمية').setPlaceholder('مثال: 150').setStyle(TextInputStyle.Short).setRequired(true)));
         return interaction.showModal(modal);
+      }
+      if(action==='dm'){
+        const modal=new ModalBuilder().setCustomId(`admin_dm_submit:${discordId}`).setTitle('إرسال رسالة خاصة');
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('title').setLabel('عنوان الرسالة (اختياري)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(100)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('message').setLabel('الرسالة').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1800)),
+        );
+        return interaction.showModal(modal);
+      }
+    }
+
+    if(interaction.isModalSubmit() && interaction.customId.startsWith('admin_dm_submit:')){
+      if(!isOwnerOrBoss(interaction)) return interaction.reply({content:'غير مصرح.',ephemeral:true});
+      const discordId=interaction.customId.split(':')[1];
+      const title=interaction.fields.getTextInputValue('title').trim()||'رسالة من إدارة Legendary';
+      const message=interaction.fields.getTextInputValue('message').trim();
+      const member=await interaction.guild?.members.fetch(discordId).catch(()=>null);
+      if(!member) return interaction.reply({content:'العضو غير موجود داخل السيرفر.',ephemeral:true});
+      try{
+        await member.send({embeds:[new EmbedBuilder().setTitle(title).setDescription(message).setFooter({text:'Legendary Workshop'}).setTimestamp()]});
+        await audit(interaction.user.id,'admin_dm_sent','discord_member',discordId,{title,message});
+        await adminLog('رسالة خاصة من الإدارة',`إلى: ${mention(discordId)}\nأرسلها: ${mention(interaction.user.id)}\nالعنوان: **${short(title,200)}**\nالرسالة:\n${short(message,2500)}`);
+        return interaction.reply({content:'تم إرسال الرسالة للعضو في الخاص وتسجيلها في اللوق الإداري.',ephemeral:true});
+      }catch(e:any){
+        await audit(interaction.user.id,'admin_dm_failed','discord_member',discordId,{title,message,error:String(e?.message||e)});
+        await adminLog('فشل إرسال رسالة خاصة',`إلى: ${mention(discordId)}\nحاول إرسالها: ${mention(interaction.user.id)}\nالسبب: ${short(e?.message||'الخاص مغلق أو تعذر الإرسال',1000)}\nالرسالة:\n${short(message,2000)}`);
+        return interaction.reply({content:'تعذر إرسال الرسالة؛ غالبًا الخاص عند العضو مغلق. تم تسجيل المحاولة في اللوق الإداري.',ephemeral:true});
       }
     }
 
