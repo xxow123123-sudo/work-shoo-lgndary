@@ -210,10 +210,10 @@ async function extractInvoiceAmount(bytes:Buffer){
 const employeePanelInstructions=`**تعليمات لوحة الموظفين**
 
 **بيع عِدّة**
-اضغط بيع عِدّة ثم أرسل صورة الفاتورة فقط. يقرأ البوت خانة MONEY AMOUNT ويسجل العملية تلقائيًا بنقطة واحدة.
+اضغط بيع عِدّة ثم أرسل صورة الفاتورة فقط. يقرأ البوت خانة MONEY AMOUNT ويسجل العملية تلقائيًا بنقطة واحدة. إذا لم يستطع قراءة السعر سيطلب منك كتابته يدويًا.
 
 **تعديل مركبة**
-اضغط تعديل مركبة ثم أرسل صورة الفاتورة أولًا. بعد قراءة المبلغ سيطلب منك البوت صورة المركبة المعدلة، ثم يسجل العملية تلقائيًا بخمس نقاط.
+اضغط تعديل مركبة ثم أرسل صورة الفاتورة أولًا. إذا لم يستطع البوت قراءة السعر سيطلب منك كتابته يدويًا، وبعدها سيطلب صورة المركبة المعدلة ويسجل العملية تلقائيًا بخمس نقاط.
 
 **دخول**
 اضغط دخول عند بداية دوامك.
@@ -468,10 +468,40 @@ async function deleteCollected(image?:CollectedImage|null){
   if(!image?.message) return;
   await image.message.delete().catch(()=>{});
 }
-async function readInvoiceOrFail(image:CollectedImage){
+function normalizeArabicDigits(value:string){
+  return String(value||'')
+    .replace(/[٠-٩]/g,(d)=>String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/[۰-۹]/g,(d)=>String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)));
+}
+function parseManualInvoiceAmount(text:string){
+  const normalized=normalizeArabicDigits(text)
+    .replace(/\$/g,'')
+    .replace(/،/g,',')
+    .replace(/\s+/g,' ')
+    .trim();
+  const match=normalized.match(/(?:^|\s)([0-9][0-9,]*(?:\.[0-9]{1,2})?)(?:\s|$)/);
+  if(!match) return null;
+  const amount=Number(match[1].replace(/,/g,''));
+  if(!Number.isFinite(amount)||amount<=0||amount>999999999) return null;
+  return Math.round(amount);
+}
+async function waitManualInvoiceAmount(channel:any,userId:string,interaction:any){
+  await interaction.editReply({content:'ما قدرت أقرأ سعر الفاتورة تلقائيًا. **اكتب لي سعر الفاتورة** في هذا الروم خلال دقيقتين.'});
+  for(let attempt=0;attempt<3;attempt++){
+    const c=await channel.awaitMessages({filter:(m:any)=>m.author.id===userId&&!m.author.bot&&m.content?.trim().length>0,max:1,time:120000});
+    const message=c.first();
+    if(!message) throw new Error('انتهى الوقت بدون كتابة سعر الفاتورة');
+    const amount=parseManualInvoiceAmount(message.content);
+    await message.delete().catch(()=>{});
+    if(amount!==null) return amount;
+    if(attempt<2) await interaction.editReply({content:'السعر غير واضح. **اكتب سعر الفاتورة كرقم فقط**، مثال: `15000` أو `15,000`.'});
+  }
+  throw new Error('لم يتم إدخال سعر فاتورة صحيح');
+}
+async function readInvoiceAmount(image:CollectedImage,channel:any,userId:string,interaction:any){
   const detected=await extractInvoiceAmount(image.bytes);
-  if(detected===null) throw new Error('تعذر قراءة MONEY AMOUNT من الفاتورة. أرسل صورة أوضح للفاتورة وحاول مرة أخرى.');
-  return detected;
+  if(detected!==null) return detected;
+  return waitManualInvoiceAmount(channel,userId,interaction);
 }
 
 async function refreshStatsPanel(){
@@ -729,7 +759,7 @@ client.on(Events.InteractionCreate, async interaction=>{
       let vehicle:CollectedImage|null=null;
       try{
         invoice=await waitAttachment(ch,interaction.user.id);
-        const amount=await readInvoiceOrFail(invoice);
+        const amount=await readInvoiceAmount(invoice,ch,interaction.user.id,interaction);
 
         if(kind==='tool'){
           const {error}=await db.from('service_records').insert({employee_id:emp.id,service_type:'tool_sale',points:1,invoice_amount:amount,invoice_image_url:invoice.originalUrl}); if(error) throw error;
